@@ -1,0 +1,53 @@
+{
+  "name": "dsh-reasoning-memory",
+  "version": "0.2.0",
+  "description": "Reasoning trajectory memory bundle for DeepSeek Harness",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist/",
+    "python/reasoning_memory.py",
+    "python/reasoning_memory_core/",
+    "!python/reasoning_memory_core/**/__pycache__/**",
+    "!python/reasoning_memory_core/**/*.pyc",
+    "cordis.patch.yml",
+    "README.md",
+    "MVP_EVALUATION.md"
+  ],
+  "scripts": {
+    "prepare": "tsc -p tsconfig.json",
+    "test": "npm run prepare && npm run test:python && npm run test:node",
+    "test:python": "python -m unittest discover -s test -v",
+    "test:node": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22",
+    "dsh": ">=0.1.5-alpha.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-session": "*",
+    "@deepseek-ai/dsh-storage-domain": "*",
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/schemastery": "*",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-session": "*",
+    "@deepseek-ai/dsh-storage-domain": "*",
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/schemastery": "*",
+    "@types/node": "^22.20.5",
+    "typescript": "^5.8.3",
+    "zod": "^4.0.0"
+  }
+}
