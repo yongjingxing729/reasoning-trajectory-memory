@@ -41,6 +41,14 @@ export const memoryItemSchema = z.object({
   content: z.string(),
   // Additive defaults keep the existing v1 storage records readable.
   reasoning: z.string().default(''),
+  // ReasoningBank-style structured distillation fields (title / description /
+  // content / when-NOT-to-use), plus extraction provenance. All additive.
+  title: z.string().default(''),
+  description: z.string().default(''),
+  contraindications: z.array(z.string()).default([]),
+  extractionMethod: z.enum(['caller_insight', 'llm_distillation', 'llm_self_contrast']).default('caller_insight'),
+  distillationModel: z.string().default(''),
+  sourceMemoryIds: z.array(z.string()).default([]),
   reasoningGraph: reasoningGraphSchema.default({ version: 1, nodes: [], edges: [] }),
   feedback: z.object({
     helpful: z.number().int().nonnegative(),
@@ -108,6 +116,8 @@ export const retrievalRecordSchema = z.object({
     lexical: z.number().min(0).max(1).default(0),
   }),
   fusionMode: z.enum(['weighted', 'rrf']).default('weighted'),
+  relevanceThreshold: z.number().min(0).max(1).default(0),
+  thresholdFilteredCount: z.number().int().nonnegative().default(0),
   enterpriseRuleIds: z.array(z.string()).default([]),
   enterpriseRuleRagStatus: z.enum([
     'disabled', 'ready', 'no_matches', 'unavailable', 'invalid_configuration',

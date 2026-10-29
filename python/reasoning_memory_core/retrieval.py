@@ -75,6 +75,10 @@ def _retrieve(request: dict[str, Any]) -> dict[str, Any]:
         route = "auto"
     k = max(1, min(20, int(request.get("k", 4))))
     ratio = max(0.1, min(10.0, float(request.get("positiveNegativeRatio", 1.0))))
+    threshold = 0.0
+    raw_threshold = request.get("relevanceThreshold")
+    if isinstance(raw_threshold, (int, float)):
+        threshold = max(0.0, min(1.0, float(raw_threshold)))
     memories = request.get("memories") if isinstance(request.get("memories"), list) else []
     has_sparse_candidates = any(
         isinstance(item, dict) and _rank_score(item, "lexicalScore") > 0.0
@@ -111,7 +115,7 @@ def _retrieve(request: dict[str, Any]) -> dict[str, Any]:
         reason = f"invalid reasoning graph: {graph_warning}" if graph_warning else "graph route requires a valid reasoning_graph_json"
         return {
             "results": [], "candidateScores": [], "queryHash": query_hash,
-            "balance": {"positiveCount": 0, "negativeCount": 0, "ratio": ratio, "fallbackUsed": False},
+            "balance": {"positiveCount": 0, "negativeCount": 0, "ratio": ratio, "fallbackUsed": False, "thresholdFilteredCount": 0},
             "fusionWeights": fusion_weights,
             "fusionMode": fusion_mode,
             "reason": reason,
@@ -120,7 +124,7 @@ def _retrieve(request: dict[str, Any]) -> dict[str, Any]:
     if route == "structure" and not query_signature:
         return {
             "results": [], "candidateScores": [], "queryHash": query_hash,
-            "balance": {"positiveCount": 0, "negativeCount": 0, "ratio": ratio, "fallbackUsed": False},
+            "balance": {"positiveCount": 0, "negativeCount": 0, "ratio": ratio, "fallbackUsed": False, "thresholdFilteredCount": 0},
             "fusionWeights": fusion_weights,
             "fusionMode": fusion_mode,
             "reason": "no observable tool-action sequence is available for structure retrieval",
@@ -194,6 +198,19 @@ def _retrieve(request: dict[str, Any]) -> dict[str, Any]:
         )
     hybrid_fallback = route == "hybrid" and not has_vector_candidates
 
+    # Quality gate: ReasoningBank reports that relevance beats volume (k=1
+    # outperformed k=2..4 for injection), so a configurable minimum fused score
+    # drops weak candidates before the positive/negative quota is applied.
+    threshold_filtered_count = 0
+    if threshold > 0.0:
+        kept = []
+        for row in ranked:
+            if row["combinedScore"] >= threshold:
+                kept.append(row)
+            else:
+                threshold_filtered_count += 1
+        ranked = kept
+
     ranked.sort(key=lambda row: (-row["combinedScore"], row["memoryId"]))
     positive = [row for row in ranked if row["outcome"] == "success"]
     negative = [row for row in ranked if row["outcome"] == "fail"]
@@ -255,6 +272,12 @@ def _retrieve(request: dict[str, Any]) -> dict[str, Any]:
 
     positive_count = sum(row["outcome"] == "success" for row in selected)
     negative_count = sum(row["outcome"] == "fail" for row in selected)
+    threshold_note = ""
+    if threshold > 0.0 and threshold_filtered_count > 0:
+        if not selected:
+            threshold_note = f"{threshold_filtered_count} candidates fell below the relevance threshold and none qualified"
+        else:
+            threshold_note = f"{threshold_filtered_count} candidates fell below the relevance threshold and were excluded"
     return {
         "results": selected,
         "candidateScores": candidate_scores,
@@ -264,11 +287,13 @@ def _retrieve(request: dict[str, Any]) -> dict[str, Any]:
             "negativeCount": negative_count,
             "ratio": ratio,
             "fallbackUsed": fallback_used,
+            "thresholdFilteredCount": threshold_filtered_count,
         },
         "fusionWeights": fusion_weights,
         "fusionMode": fusion_mode,
         "reason": (
-            f"invalid task reasoning graph ignored: {graph_warning}" if graph_warning
+            threshold_note if threshold_note
+            else f"invalid task reasoning graph ignored: {graph_warning}" if graph_warning
             else "hybrid route had no dense-vector candidates; sparse and graph rankings were used" if hybrid_fallback
             else ""
         ),

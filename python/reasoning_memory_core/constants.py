@@ -11,11 +11,31 @@ TAG_TEXT = {
     "rollback": "根据失败结果回退或修正",
 }
 
-EXTRACTOR_VERSION = "dsh-reasoning-memory/0.2.0"
+EXTRACTOR_VERSION = "dsh-reasoning-memory/0.3.0"
 
 MAX_CAPTURED_EVENTS = 2000
 
 MAX_MEMORY_TEXT = 4000
+
+MAX_TITLE_CHARS = 120
+
+MAX_DESCRIPTION_CHARS = 300
+
+MAX_CONTRAINDICATION_CHARS = 200
+
+MAX_CONTRAINDICATIONS = 3
+
+MAX_ITEMS_PER_OUTCOME = 3
+
+MAX_SOURCE_MEMORY_IDS = 10
+
+MAX_REASONING_TEXT_CHARS = 4000
+
+# Above this similarity a distilled lesson is judged a near-verbatim copy of the
+# task description and is rejected as too task-specific to transfer.
+DEDUP_SIMILARITY = 0.9
+
+EXTRACTION_METHODS = {"caller_insight", "llm_distillation", "llm_self_contrast"}
 
 MAX_GRAPH_NODES = 24
 

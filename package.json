@@ -1,6 +1,6 @@
 {
   "name": "dsh-reasoning-memory",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Reasoning trajectory memory bundle for DeepSeek Harness",
   "type": "module",
   "main": "./dist/index.js",
@@ -34,6 +34,7 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-llm": "*",
     "@deepseek-ai/dsh-session": "*",
     "@deepseek-ai/dsh-storage-domain": "*",
     "@deepseek-ai/dsh-tools": "*",
@@ -42,6 +43,7 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-llm": "*",
     "@deepseek-ai/dsh-session": "*",
     "@deepseek-ai/dsh-storage-domain": "*",
     "@deepseek-ai/dsh-tools": "*",

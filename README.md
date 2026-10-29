@@ -7,6 +7,7 @@
 - TypeScript：Cordis 入口、DSH 工具注册、会话与 `task_id` 关联、生命周期和 DSH 领域存储；另维护本地 BM25 倒排索引及可选 Qdrant 向量索引。
 - Python：轨迹事件归纳、推理策略蒸馏、逻辑图匹配、RRF/加权检索融合、受限效用调节和正反记忆配比；按功能拆分在 `python/reasoning_memory_core/`，`reasoning_memory.py` 仅保留稳定 CLI 入口与兼容导出。
 - 持久化内容是成功策略或可归因失败教训，含适用前提、来源事件序号、验证材料、信任等级与结构签名。活动任务及原始轨迹只暂存在内存。
+- 蒸馏条目按 ReasoningBank 的 title/description/content/contraindications 结构化保存（每次最多 `maxMemoryItemsPerOutcome` 条）；`memory_items` 结构化提交、可选 LLM 轨迹蒸馏与 `memory_consolidate` 自对比整合共用同一套确定性守卫：失败可归因门控、去特异化（近复述任务描述被拒）与批内去重。原始 reasoning 文本仍不持久化。
 - 不读取或保存工具参数/输出、完整提示词或模型提供的 reasoning/CoT。结构签名只来自可观察的工具调用及其结果。
 - 用户/模型提供的 verifier 名称和 evidence 目前不能由插件独立核实；所有新条目都明确标记 `trustLevel: unverified`，不会被提升为 `verified`。
 - `confidence` 是固定的蒸馏启发值，不是成功概率，也没有跨任务校准。
@@ -18,6 +19,8 @@
 默认一次返回 4 条，成功:失败配比为 `1:1`，由 `positiveNegativeRatio` 配置（例如 `2` 表示 `2:1`）。当某一侧数量不足时，剩余名额按融合分数由另一侧补齐，并在工具结果中返回 `fallbackUsed`；奇数 `k` 会取最接近的整数配额。`partial` 与 `unknown` 不进入正/负池；失败没有证据支持的归因时不会生成负向记忆。
 
 默认 `auto` 在本地 BM25 找到候选后切换为 RRF 融合；若 BM25 无命中，则回退全量 Python 排序，沿用下面的透明加权公式。成功与失败各自独立召回候选，再由 Python 按正反配额挑选。显式图或动作路由会扫描全部记忆，以免 BM25 门控漏掉结构/图相似项。
+
+`relevanceThreshold`（默认 0，关闭）在正反配额前过滤融合分数过低的候选，过滤数量计入检索审计的 `thresholdFilteredCount`。ReasoningBank 的消融显示检索 k=1 优于 k=2..4（质量高于数量），因此检索结果附带元认知引导：逐条判断哪些记忆真正适用于当前子问题、哪些不适用。
 
 ### 混合检索与可选向量索引
 
@@ -74,6 +77,8 @@ dsh plugin --profile <profile> add <path-to-this-repository>
 
 DSH 通过 `dsh.bundle.patch` 自动将 `reasoning-memory` 插件行加入 profile。需要本机可调用 Python 3.10 或更高版本；Windows 默认命令为 `python`，其他平台默认 `python3`，可在 Cordis 插件配置中设置 `pythonExecutable`。配置项还包括 `maxMemories`、`maxRetrievalRecords`、`maxTrajectoryEvents` 和 `positiveNegativeRatio`。
 
+推理捕获与蒸馏的可选配置：`captureReasoningEnabled`（默认关闭；开启后 `assistant/message` 的 reasoning 内容块与 token usage 仅暂存在内存，`memory_end_task` 汇总返回，不持久化）、`maxReasoningTextChars`（默认 4000）、`llmDistillationEnabled`、`llmDistillationTemperature`（默认 1.0）、`distillationProvider`/`distillationModel`（留空时复用本任务捕获的模型）、`maxMemoryItemsPerOutcome`（1–3，默认 3）、`deSpecificationThreshold`（默认 0.9）、`relevanceThreshold`（默认 0）、`memoryConsolidationEnabled`。蒸馏与整合通过 `ctx.get('llm')` 使用 DSH llm 服务；服务缺失、模型未配置或调用失败时自动回退到调用者提交的 insight 路径。
+
 向量检索的可选配置示例（其余 DSH profile 字段依开发文档提供）：
 
 ```yaml
@@ -101,8 +106,9 @@ reasoning-memory:
 1. `memory_begin_task` 开始任务并返回 `task_id`。每个 DSH session 同一时间只接受一个活跃任务。
 2. 需要时调用 `memory_retrieve`。结果含策略内容、前提、成功/失败标签、分路分数、信任等级和事件来源；把它当作参考证据，并在当前环境重新验证。
 3. 可选调用 `memory_feedback`，只提交当前任务检索到且调用者确认实际用过的记忆；给出短证据，但插件不会保存证据文本或独立核实评价。
-4. 调用 `memory_save_outcome`，提交 outcome、verifier、evidence；成功时还要提交一句可迁移的 reasoning insight，失败时只在归因明确时提交 failure_mode。
+4. 调用 `memory_save_outcome`，提交 outcome、verifier、evidence；成功时还要提交一句可迁移的 reasoning insight，失败时只在归因明确时提交 failure_mode。也可以提交最多 3 条结构化 `memory_items`（title/description/content/contraindications），或当 profile 开启 `llmDistillationEnabled` 时让插件对捕获轨迹做 LLM 蒸馏（`distill_with_llm: false` 可单次关闭；复用本任务所用模型，除非显式配置 `distillationProvider`/`distillationModel`）。
 5. 调用 `memory_end_task` 清理活动轨迹。若没有 outcome 或失败无法归因，不会写入伪造的记忆条目。
+6. 可选：对同一类任务多次尝试得到的记忆调用 `memory_consolidate`（需 profile 开启 `memoryConsolidationEnabled` 并配置蒸馏模型），用自对比推理把成败经验对比蒸馏成更高质量条目（MaTTS 并行扩展的落点）；源记忆保留，新条目逐条标记 success/fail。
 
 `reasoning_memory` 使用 DSH JSON storage domain 的 `per-record` 布局。新增的记忆/审计字段有默认值，兼容已有 v1 记录；旧记忆若没有独立 `reasoning` 字段，Python 会从旧版 `content` 前缀尽力恢复教训用于检索。DSH storage-domain 本身不提供自动数据迁移。MVP 不实现自动逐轮注入、自动重试、LLM-as-judge、在线 bandit 或推理预算控制。完整研究取舍、局限和评测计划见 [MVP_EVALUATION.md](./MVP_EVALUATION.md)。
 

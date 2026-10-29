@@ -44,6 +44,10 @@ def _reasoning_text(item: dict[str, Any]) -> str:
     prefixes = (
         "调用者提炼的可迁移推理策略（未独立验证）：",
         "失败模式（由任务调用者归因，尚未独立验证）：",
+        "从任务轨迹蒸馏的可迁移推理策略（未独立验证）：",
+        "失败模式（从任务轨迹蒸馏归因，尚未独立验证）：",
+        "由成败轨迹对比蒸馏的可迁移推理策略（未独立验证）：",
+        "失败模式（由成败轨迹对比蒸馏归因，尚未独立验证）：",
     )
     for prefix in prefixes:
         if content.startswith(prefix):

@@ -15,8 +15,11 @@ function graphSearchText(item: MemoryItem): string {
 export function memorySearchText(item: MemoryItem): string {
   return [
     `task: ${item.semanticText}`,
+    `title: ${item.title ?? ''}`,
+    `description: ${item.description ?? ''}`,
     `reasoning lesson: ${item.reasoning || item.content}`,
-    `preconditions: ${item.preconditions.join('; ')}`,
+    `preconditions: ${(item.preconditions ?? []).join('; ')}`,
+    `contraindications: ${(item.contraindications ?? []).join('; ')}`,
     `actions: ${item.structureSignature.join(' -> ')}`,
     `logic graph:\n${graphSearchText(item)}`,
   ].filter(part => part.trim()).join('\n')
