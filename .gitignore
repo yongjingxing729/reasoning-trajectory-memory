@@ -1,6 +1,8 @@
 dist/
 node_modules/
+
 __pycache__/
 *.pyc
 /.reasoning-memory-data/
 /.npm-cache-tmp/
+.env
