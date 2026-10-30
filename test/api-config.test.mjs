@@ -237,6 +237,27 @@ test('embeddings() resolves vectors through the endpoint and http-json request()
   }
 })
 
+test('openAiChat honors the endpoint timeout when the caller signal never fires', { timeout: 10_000 }, async () => {
+  // A server that accepts the request but never answers.
+  const { server, port } = await startServer(() => {})
+  const { dir, path } = makeConfigDir(fixtureYaml(port)
+    .replace('    temperature: 1.0', '    temperature: 1.0\n    timeoutMs: 300'))
+  const service = new ApiConfigService(path, silentLogger)
+  assert.equal(service.load(), true)
+  try {
+    await assert.rejects(
+      () => service.openAiChat('distillation', 's', 'u', 1.0, new AbortController().signal),
+      /aborted|timeout|abort|Terminated/i,
+    )
+  } finally {
+    service.stop()
+    // The aborted request still owns a socket; destroy it so close() returns.
+    server.closeAllConnections?.()
+    await new Promise(resolve => server.close(resolve))
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('file watch hot-reloads valid edits and keeps the last good config on bad edits', async () => {
   const { dir, path } = makeConfigDir(fixtureYaml(1))
   const service = new ApiConfigService(path, silentLogger)

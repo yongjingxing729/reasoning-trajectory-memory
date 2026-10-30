@@ -207,6 +207,11 @@ export class ApiConfigService {
   stop(): void {
     if (this.reloadTimer) clearTimeout(this.reloadTimer)
     this.watcher?.close()
+    for (const agent of this.proxyAgents.values()) {
+      // Release keep-alive sockets held by the proxy agents.
+      void agent.close().catch(() => {})
+    }
+    this.proxyAgents.clear()
   }
 
   get loaded(): boolean {
@@ -336,7 +341,9 @@ export class ApiConfigService {
         ],
         temperature: Math.min(2, Math.max(0, temperature)),
       }),
-      signal,
+      // The caller's signal wins when it fires first; otherwise the endpoint
+      // timeout bounds the call on its own.
+      signal: AbortSignal.any([signal, AbortSignal.timeout(this.effectiveTimeout(endpoint))]),
     })
     if (!response.ok) throw new Error(`chat endpoint '${name}' failed (${response.status})`)
     const payload = await response.json() as { choices?: Array<{ message?: { content?: unknown } }> }

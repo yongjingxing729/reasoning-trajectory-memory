@@ -1388,7 +1388,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     async execute(args, exec) {
       const notApplicable = (reason: string) => ({ stored: false as const, reason, memoryIds: [], trustLevel: 'not-applicable' as const })
       if (!config.memoryConsolidationEnabled) return notApplicable('memory_consolidate is disabled in this profile; set memoryConsolidationEnabled.')
-      const apiChatAvailable = apiConfig?.endpointKind('distillation') === 'openai-chat'
+      // Same precedence rule as memory_save_outcome: an explicit profile
+      // distillationProvider wins; the API-config chat endpoint only takes
+      // over when the profile left that model unset.
+      const apiChatAvailable = !config.distillationProvider!.trim()
+        && apiConfig?.endpointKind('distillation') === 'openai-chat'
       const llm = ctx.get('llm') as LlmRuntime | undefined
       if (!apiChatAvailable && !llm) return notApplicable('memory_consolidate requires the llm service or a distillation endpoint in the API config file.')
       const provider = config.distillationProvider!.trim()

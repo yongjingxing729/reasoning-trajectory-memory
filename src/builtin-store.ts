@@ -107,6 +107,7 @@ export class BuiltinMemoryStore {
   private embedder: EmbeddingClient | undefined
   private schemaReady: Promise<void> | undefined
   private embeddingsDisabled = false
+  private closed = false
   // All database operations flow through one queue so concurrent callers
   // (startup sync, write-through, retrieval, queries, close) serialize
   // deterministically and close always runs after every in-flight op.
@@ -140,6 +141,7 @@ export class BuiltinMemoryStore {
   }
 
   private open(): PGlite {
+    if (this.closed) throw new Error('the built-in store is closed')
     if (this.db) return this.db
     this.db = this.options.dataDir
       ? new PGlite(this.options.dataDir, { extensions: { vector } })
@@ -542,11 +544,15 @@ export class BuiltinMemoryStore {
 
   async close(): Promise<void> {
     // Serialized after every in-flight operation; a closed store rejects
-    // further database use cleanly instead of racing the shutdown.
+    // further database use cleanly instead of racing the shutdown or
+    // silently resurrecting an in-memory database.
     await this.enqueue(async () => {
-      if (!this.db) return
-      await this.db.close()
-      this.db = undefined
+      if (this.closed) return
+      this.closed = true
+      if (this.db) {
+        await this.db.close()
+        this.db = undefined
+      }
       this.schemaReady = undefined
     })
   }

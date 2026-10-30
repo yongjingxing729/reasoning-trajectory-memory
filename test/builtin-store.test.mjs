@@ -220,3 +220,19 @@ test('built-in store delete removes rows', async () => {
   assert.deepEqual(rows.map(row => row.memoryId), ['m2'])
   await store.close()
 })
+
+test('a closed built-in store rejects further use instead of resurrecting', async () => {
+  const { fetcher } = embeddingFetch()
+  const store = new BuiltinMemoryStore(storeOptions(), fetcher)
+  await store.synchronize([memory('m1')])
+  await store.close()
+  await store.close() // idempotent
+  await assert.rejects(
+    () => store.queryStructured({ limit: 10, offset: 0, sortBy: 'created_at', sortOrder: 'desc' }),
+    /closed/,
+  )
+  await assert.rejects(
+    () => store.synchronize([memory('m2')]),
+    /closed/,
+  )
+})

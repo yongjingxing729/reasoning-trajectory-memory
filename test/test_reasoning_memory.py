@@ -607,6 +607,29 @@ class JsonBridgeTests(unittest.TestCase):
                 (directory / file).unlink(missing_ok=True)
             directory.rmdir()
 
+    def test_cli_file_io_mode_reports_errors_to_the_error_file(self) -> None:
+        script = ROOT / "python" / "reasoning_memory.py"
+        directory = ROOT / "test" / ".tmp-file-io-test"
+        directory.mkdir(exist_ok=True)
+        try:
+            input_path = directory / "request.json"
+            output_path = directory / "response.json"
+            error_path = directory / "error.txt"
+            input_path.write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
+            completed = subprocess.run(
+                [sys.executable, str(script), "--file-io", str(input_path), str(output_path), str(error_path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("core error", error_path.read_text(encoding="utf-8"))
+            self.assertFalse(output_path.exists())
+        finally:
+            for file in ("request.json", "response.json", "error.txt"):
+                (directory / file).unlink(missing_ok=True)
+            directory.rmdir()
+
     def test_cli_pipe_transport_is_utf8_safe_for_chinese_content(self) -> None:
         # Regression for the en-US Windows CI failure: text-mode stdout used the
         # console codepage (cp1252), which cannot encode the Chinese content the

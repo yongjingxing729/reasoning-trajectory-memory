@@ -42,13 +42,14 @@ export async function runReasoningCore<T>(
     const startFileTransport = () => {
       const inputFile = join(tmpdir(), `rm-req-${randomUUID()}.json`)
       const outputFile = join(tmpdir(), `rm-res-${randomUUID()}.json`)
+      const errorFile = join(tmpdir(), `rm-err-${randomUUID()}.txt`)
       try {
         writeFileSync(inputFile, JSON.stringify(input))
       } catch (error) {
         finish(error instanceof Error ? error : new Error(String(error)))
         return
       }
-      child = spawn(executable, [workerPath, '--file-io', inputFile, outputFile], {
+      child = spawn(executable, [workerPath, '--file-io', inputFile, outputFile, errorFile], {
         stdio: 'ignore',
         windowsHide: true,
       })
@@ -57,14 +58,20 @@ export async function runReasoningCore<T>(
         if (settled) return
         try {
           if (code !== 0) {
-            finish(new Error(`reasoning-memory Python core exited ${code} in file-io mode`))
+            let detail = ''
+            try {
+              detail = readFileSync(errorFile, 'utf8').trim()
+            } catch {
+              // The worker may have died before writing diagnostics.
+            }
+            finish(new Error(detail || `reasoning-memory Python core exited ${code} in file-io mode`))
             return
           }
           finish(undefined, JSON.parse(readFileSync(outputFile, 'utf8')) as T)
         } catch (error) {
           finish(new Error(`reasoning-memory Python core returned invalid JSON: ${String(error)}`))
         } finally {
-          for (const file of [inputFile, outputFile]) {
+          for (const file of [inputFile, outputFile, errorFile]) {
             try {
               rmSync(file, { force: true })
             } catch {
@@ -88,7 +95,13 @@ export async function runReasoningCore<T>(
       pipeChild.stderr.setEncoding('utf8')
       pipeChild.stdout.on('data', chunk => { stdout += chunk })
       pipeChild.stderr.on('data', chunk => { stderr += chunk })
-      pipeChild.stdin.on('error', error => finish(error))
+      pipeChild.stdin.on('error', error => {
+        // A failed pipe spawn surfaces on stdin AND on the child. The child's
+        // 'error' handler owns the EPERM fallback, so a stdin EPERM must not
+        // settle the promise first and skip the file transport.
+        if ((error as NodeJS.ErrnoException).code === 'EPERM') return
+        finish(error)
+      })
       pipeChild.once('error', error => {
         // A failed pipe spawn still emits 'close' afterwards; mark it so the
         // close handler cannot settle while the file transport is running.

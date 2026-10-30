@@ -50,9 +50,18 @@ def _run_file_io(argv: list[str]) -> int:
     if flag + 2 >= len(argv):
         raise ValueError("--file-io requires an input path and an output path")
     input_path, output_path = argv[flag + 1], argv[flag + 2]
-    with open(input_path, "r", encoding="utf-8") as source:
-        request = json.load(source)
-    response = _process(request)
+    error_path = argv[flag + 3] if flag + 3 < len(argv) else ""
+    try:
+        with open(input_path, "r", encoding="utf-8") as source:
+            request = json.load(source)
+        response = _process(request)
+    except Exception as error:
+        # stdio is detached in file mode; route diagnostics to the error file
+        # so the host can attach the reason to its failure.
+        if error_path:
+            with open(error_path, "w", encoding="utf-8") as target:
+                target.write(f"reasoning-memory core error: {error}\n")
+        return 2
     with open(output_path, "w", encoding="utf-8") as target:
         target.write(response)
     return 0
