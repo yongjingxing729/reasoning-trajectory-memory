@@ -607,6 +607,35 @@ class JsonBridgeTests(unittest.TestCase):
                 (directory / file).unlink(missing_ok=True)
             directory.rmdir()
 
+    def test_cli_pipe_transport_is_utf8_safe_for_chinese_content(self) -> None:
+        # Regression for the en-US Windows CI failure: text-mode stdout used the
+        # console codepage (cp1252), which cannot encode the Chinese content the
+        # core returns. The protocol must be UTF-8 bytes regardless of locale.
+        script = ROOT / "python" / "reasoning_memory.py"
+        request = {
+            "operation": "distill",
+            "taskId": "task-zh",
+            "sourceSessionId": "session-zh",
+            "taskFamily": "general",
+            "semanticText": "发布前校验模式",
+            "events": tool_events(),
+            "outcome": "success",
+            "verifier": "unit-suite",
+            "evidence": "校验后测试通过",
+            "reasoningInsight": "发布生成产物前先校验源模式",
+            "failureMode": "",
+        }
+        completed = subprocess.run(
+            [sys.executable, str(script)],
+            input=json.dumps(request, ensure_ascii=False).encode("utf-8"),
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", errors="replace"))
+        response = json.loads(completed.stdout.decode("utf-8"))
+        self.assertTrue(response["stored"])
+        self.assertEqual(response["memories"][0]["reasoning"], "发布生成产物前先校验源模式")
+
 
 if __name__ == "__main__":
     unittest.main()

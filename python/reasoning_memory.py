@@ -62,11 +62,20 @@ def main() -> int:
     try:
         if "--file-io" in sys.argv:
             return _run_file_io(list(sys.argv))
-        request = json.load(sys.stdin)
-        sys.stdout.write(_process(request))
+        # Machine-to-machine protocol: read/write UTF-8 BYTES through the
+        # binary buffers. Text-mode stdio would pick the console codepage
+        # (cp1252/cp936/...), which breaks non-ASCII content on non-Chinese
+        # Windows locales (e.g. the en-US CI runners).
+        request = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+        response = _process(request)
+        sys.stdout.buffer.write(response.encode("utf-8"))
+        sys.stdout.buffer.flush()
         return 0
     except Exception as error:  # Report a transport-safe failure to stderr.
-        sys.stderr.write(f"reasoning-memory core error: {error}\n")
+        sys.stderr.buffer.write(
+            f"reasoning-memory core error: {error}\n".encode("utf-8", errors="replace"),
+        )
+        sys.stderr.buffer.flush()
         return 2
 
 
