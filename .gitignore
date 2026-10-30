@@ -2,5 +2,5 @@ dist/
 node_modules/
 __pycache__/
 *.pyc
-/test/
-/tests/
+/.reasoning-memory-data/
+/.npm-cache-tmp/

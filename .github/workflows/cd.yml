@@ -1,0 +1,88 @@
+name: CD
+
+# Deployment verification for the DSH plugin bundle: build, test, pack the
+# npm tarball exactly as a profile install would receive it, verify its
+# contents, and boot the EXTRACTED artifact in a mock DSH host to prove the
+# shipped package deploys. A real `dsh plugin add` release step stays manual:
+# DSH is a desktop runtime and is not installed headless on these runners.
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: npm ci
+      - name: Build (TypeScript)
+        run: npm run prepare
+      - name: Python core tests
+        run: npm run test:python
+      - name: Node tests
+        run: npm run test:node
+
+  pack:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build (TypeScript)
+        run: npm run prepare
+      - name: Pack the plugin tarball
+        run: npm pack --pack-destination artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-tarball
+          path: artifacts/*.tgz
+          if-no-files-found: error
+
+  deploy-smoke:
+    needs: pack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          name: plugin-tarball
+          path: artifacts
+      # Extract inside the checkout so the bundle's ESM imports resolve the
+      # dependencies from the repository node_modules — the same layout a DSH
+      # profile install uses.
+      - name: Extract the shipped tarball
+        run: mkdir -p bundle-extracted && tar -xzf artifacts/*.tgz -C bundle-extracted
+      - name: Verify the bundle contents
+        run: node scripts/verify-bundle.mjs bundle-extracted/package
+      - name: Boot the extracted bundle in a mock DSH host (deployment smoke)
+        run: node test/plugin-smoke.test.mjs
+        env:
+          PLUGIN_BUNDLE_ENTRY: bundle-extracted/package/dist/index.js
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-plugin-tarball
+          path: artifacts/*.tgz
+          if-no-files-found: error

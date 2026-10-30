@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import type { MemoryItem } from './domain.js'
 import { memorySearchText, querySearchText } from './search-text.js'
+import { EmbeddingClient } from './embedding-client.js'
 
 export interface QdrantMemoryIndexOptions {
   qdrantUrl: string
@@ -37,6 +38,7 @@ export class QdrantMemoryIndex {
   private readonly baseUrl: string
   private readonly collectionPath: string
   private readonly fetcher: typeof fetch
+  private readonly embedder: EmbeddingClient
 
   constructor(
     private readonly options: QdrantMemoryIndexOptions,
@@ -45,9 +47,12 @@ export class QdrantMemoryIndex {
     this.baseUrl = options.qdrantUrl.replace(/\/+$/, '')
     this.collectionPath = `/collections/${encodeURIComponent(options.collection)}`
     this.fetcher = fetcher
-    if (!Number.isInteger(options.embeddingDimension) || options.embeddingDimension < 1) {
-      throw new Error('embedding dimension must be a positive integer')
-    }
+    this.embedder = new EmbeddingClient({
+      embeddingUrl: options.embeddingUrl,
+      embeddingModel: options.embeddingModel,
+      embeddingApiKey: options.embeddingApiKey,
+      embeddingDimension: options.embeddingDimension,
+    }, fetcher)
   }
 
   async synchronize(memories: MemoryItem[]): Promise<void> {
@@ -79,7 +84,7 @@ export class QdrantMemoryIndex {
   }
 
   async search(query: string, reasoningGraphJson: string, excludeTaskId: string): Promise<VectorCandidate[]> {
-    const [queryVector] = await this.embed([querySearchText(query, reasoningGraphJson)])
+    const [queryVector] = await this.embedder.embed([querySearchText(query, reasoningGraphJson)])
     const outcomes: Outcome[] = ['success', 'fail']
     const batches = await Promise.all(outcomes.map(async outcome => {
       const filter: Record<string, unknown> = {
@@ -188,7 +193,7 @@ export class QdrantMemoryIndex {
 
   private async upsertBatch(memories: MemoryItem[]): Promise<void> {
     if (memories.length === 0) return
-    const vectors = await this.embed(memories.map(memorySearchText))
+    const vectors = await this.embedder.embed(memories.map(memorySearchText))
     const points = memories.map((item, index) => ({
       id: item.memoryId,
       vector: vectors[index],
@@ -202,31 +207,6 @@ export class QdrantMemoryIndex {
     await this.request(`${this.collectionPath}/points?wait=true`, {
       method: 'PUT',
       body: JSON.stringify({ points }),
-    })
-  }
-
-  private async embed(inputs: string[]): Promise<number[][]> {
-    const headers: Record<string, string> = { 'content-type': 'application/json' }
-    if (this.options.embeddingApiKey) headers.authorization = `Bearer ${this.options.embeddingApiKey}`
-    const response = await this.fetcher(this.options.embeddingUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ model: this.options.embeddingModel, input: inputs }),
-      signal: AbortSignal.timeout(30_000),
-    })
-    if (!response.ok) throw new Error(`embedding provider request failed (${response.status})`)
-    const payload = await response.json() as { data?: Array<{ index?: number; embedding?: number[] }> }
-    if (!Array.isArray(payload.data) || payload.data.length !== inputs.length) {
-      throw new Error('embedding provider returned an unexpected result count')
-    }
-    const ordered = [...payload.data].sort((left, right) => (left.index ?? 0) - (right.index ?? 0))
-    return ordered.map(row => {
-      const vector = row.embedding
-      if (!Array.isArray(vector) || vector.length !== this.options.embeddingDimension
-        || !vector.every(value => Number.isFinite(value))) {
-        throw new Error(`embedding provider must return finite vectors of dimension ${this.options.embeddingDimension}`)
-      }
-      return vector
     })
   }
 

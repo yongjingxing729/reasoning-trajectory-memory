@@ -20,8 +20,10 @@
   "scripts": {
     "prepare": "tsc -p tsconfig.json",
     "test": "npm run prepare && npm run test:python && npm run test:node",
-    "test:python": "python -m unittest discover -s test -v",
-    "test:node": "node --test test/*.test.mjs"
+    "test:python": "node scripts/run-python-tests.mjs",
+    "test:node": "node --test test/*.test.mjs",
+    "test:smoke": "node test/plugin-smoke.test.mjs",
+    "verify:bundle": "node scripts/verify-bundle.mjs"
   },
   "engines": {
     "node": ">=22",
@@ -51,5 +53,10 @@
     "@types/node": "^22.20.5",
     "typescript": "^5.8.3",
     "zod": "^4.0.0"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.4.6",
+    "undici": "^8.12.3",
+    "yaml": "^2.9.1"
   }
 }

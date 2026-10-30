@@ -1,0 +1,50 @@
+# reasoning-memory 用户 API 端点配置模板
+#
+# 用法：复制本文件到任意本地路径，在插件 profile 中设置：
+#   reasoning-memory:
+#     apiConfigPath: <本文件的绝对路径>
+# 编辑后立即生效（热重载）；语法错误会保留上一份好配置。
+# 注意：本文件包含密钥来源配置，请勿把真实密钥写进仓库。
+#
+# 完整说明见 README「用户 API 端点配置（apiConfigPath，可选）」一节。
+
+version: 1
+
+# 全局代理：国内访问国外 API 时使用（如 Clash http 端口）。
+# url 留空 = 所有请求直连。noProxy 中的主机不走代理。
+proxy:
+  url: http://127.0.0.1:7897
+  noProxy:
+    - 127.0.0.1
+    - localhost
+
+# 全局默认值（可被端点级配置覆盖）
+defaults:
+  timeoutMs: 30000
+
+# 命名端点：插件按名字引用，按 kind 校验契约
+endpoints:
+  # 向量嵌入（内置库 / Qdrant / 企业规则共享此端点）
+  embeddings:
+    kind: openai-embeddings
+    baseUrl: https://api.openai.com/v1          # 实际请求 {baseUrl}/embeddings
+    apiKeyEnv: OPENAI_API_KEY                   # 推荐：从环境变量读 key
+    # apiKey: sk-...                            # 或内联（明文，状态页会标记 inline）
+    model: text-embedding-3-small
+    dimension: 1536
+    # proxy: direct                             # 可选覆盖：direct=直连 / 具体 URL / 留空=继承全局
+
+  # LLM 蒸馏与 memory_consolidate 的自对比整合
+  distillation:
+    kind: openai-chat
+    baseUrl: https://api.deepseek.com           # 实际请求 {baseUrl}/chat/completions
+    apiKeyEnv: DEEPSEEK_API_KEY
+    model: deepseek-chat
+    temperature: 1.0
+
+  # 示例：给未来插件功能预留的通用 HTTP 端点（kind: http-json）
+  # my-helper:
+  #   kind: http-json
+  #   baseUrl: https://some.service.example
+  #   headers:
+  #     X-Custom: abc

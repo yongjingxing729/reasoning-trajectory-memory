@@ -4,7 +4,7 @@
 
 ## 实现范围
 
-- TypeScript：Cordis 入口、DSH 工具注册、会话与 `task_id` 关联、生命周期和 DSH 领域存储；另维护本地 BM25 倒排索引及可选 Qdrant 向量索引。
+- TypeScript：Cordis 入口、DSH 工具注册、会话与 `task_id` 关联、生命周期和 DSH 领域存储；另维护本地 BM25 倒排索引、可选 Qdrant 向量索引，以及内置 PostgreSQL（PGlite + pgvector）结构化/向量存储。
 - Python：轨迹事件归纳、推理策略蒸馏、逻辑图匹配、RRF/加权检索融合、受限效用调节和正反记忆配比；按功能拆分在 `python/reasoning_memory_core/`，`reasoning_memory.py` 仅保留稳定 CLI 入口与兼容导出。
 - 持久化内容是成功策略或可归因失败教训，含适用前提、来源事件序号、验证材料、信任等级与结构签名。活动任务及原始轨迹只暂存在内存。
 - 蒸馏条目按 ReasoningBank 的 title/description/content/contraindications 结构化保存（每次最多 `maxMemoryItemsPerOutcome` 条）；`memory_items` 结构化提交、可选 LLM 轨迹蒸馏与 `memory_consolidate` 自对比整合共用同一套确定性守卫：失败可归因门控、去特异化（近复述任务描述被拒）与批内去重。原始 reasoning 文本仍不持久化。
@@ -21,6 +21,59 @@
 默认 `auto` 在本地 BM25 找到候选后切换为 RRF 融合；若 BM25 无命中，则回退全量 Python 排序，沿用下面的透明加权公式。成功与失败各自独立召回候选，再由 Python 按正反配额挑选。显式图或动作路由会扫描全部记忆，以免 BM25 门控漏掉结构/图相似项。
 
 `relevanceThreshold`（默认 0，关闭）在正反配额前过滤融合分数过低的候选，过滤数量计入检索审计的 `thresholdFilteredCount`。ReasoningBank 的消融显示检索 k=1 优于 k=2..4（质量高于数量），因此检索结果附带元认知引导：逐条判断哪些记忆真正适用于当前子问题、哪些不适用。
+
+### 内置 PostgreSQL 与向量存储（可选）
+
+- `builtinStoreEnabled`（默认关闭）启用进程内 PostgreSQL（PGlite 0.4.x，携带 pgvector 0.8 扩展）：记忆以结构化列 + JSONB 字段存储（结构化 JSON 数据），同时每行保存稠密向量并建 HNSW 余弦索引，作为内置向量数据库。`builtinStoreDataDir` 留空时运行在内存中（每次启动从 `storageDomain` 重建）；配置目录后数据库文件落盘持久化。
+- 内置库是**派生存储**：`storageDomain` 仍是事实源。每行维护两个哈希——`contentHash`（嵌入输入文本 + 嵌入配置，驱动重新嵌入）与 `rowHash`（完整结构化行，驱动行刷新但不重嵌）——启动时按哈希增量同步、移除过期行；维度/嵌入配置变化会重建表。写入路径为：先提交 DSH domain，再异步透传到内置库。
+- 内置库启用时接管向量候选召回（替代外部 Qdrant 的角色；两者同时开启时内置库优先，Qdrant 闲置）。同步期间或降级时检索回退 BM25；嵌入服务不可用时结构化行照常入库并降级为 json-only，仅向量检索不可用。检索不等待全量回填。
+- `memory_query` 工具提供安全的结构化 JSON 查询：按 outcome / 类型 / 信任等级 / task 范围子串过滤，支持分页与排序，全部参数化、无原始 SQL；内置库不可用时自动回退为对规范存储的等价扫描。
+
+### 用户 API 端点配置（apiConfigPath，可选）
+
+profile 设置 `apiConfigPath` 指向一个本地 YAML 文件后，插件的所有对外 API 调用（嵌入、LLM 蒸馏、未来新增功能）都从该文件取端点配置，用户可随时编辑，无需改 profile 或重启：
+
+```yaml
+# reasoning-memory API 配置 — 可热编辑，无效内容自动回退上一份好配置
+version: 1
+
+proxy:                    # 全局代理：国内访问国外 API 时使用
+  url: http://127.0.0.1:7897
+  noProxy: [127.0.0.1, localhost]
+
+defaults:
+  timeoutMs: 30000
+
+endpoints:                # 命名端点；插件按名字引用，按 kind 校验契约
+  embeddings:             # kind: openai-embeddings
+    kind: openai-embeddings
+    baseUrl: https://api.openai.com/v1        # 实际请求 {baseUrl}/embeddings
+    apiKeyEnv: OPENAI_API_KEY                 # 推荐：从环境变量读 key
+    model: text-embedding-3-small
+    dimension: 1536
+    # proxy: direct                            # 可选：'direct' 直连 / 具体 URL / 留空继承全局
+
+  distillation:           # kind: openai-chat（LLM 蒸馏 / memory_consolidate 使用）
+    kind: openai-chat
+    baseUrl: https://api.deepseek.com         # 实际请求 {baseUrl}/chat/completions
+    apiKeyEnv: DEEPSEEK_API_KEY
+    model: deepseek-chat
+    temperature: 1.0
+
+  my-helper:              # kind: http-json：给未来功能的通用透传端点
+    kind: http-json
+    baseUrl: https://some.service.example
+    headers: { X-Custom: abc }
+```
+
+规则与语义：
+
+- **契约校验**：每个端点声明一种 `kind`（`openai-embeddings` / `openai-chat` / `http-json`）；插件按功能需要校验端点种类，不匹配时明确报错，不会把请求发错。
+- **密钥来源**：`apiKeyEnv`（环境变量，推荐）与 `apiKey`（内联明文，状态页会标记）二选一；任何状态输出与日志都只显示来源、不显示值。
+- **代理**：全局 `proxy` + 每端点覆盖（`direct` 关键字直连）；`noProxy` 支持精确主机、`.domain` 后缀与通配。Node fetch 不读系统代理，插件用 undici ProxyAgent 实现，代理/noProxy 改动**热生效**；密钥与 baseUrl 改动热生效；**模型/维度改动需重启**（pgvector 表维度与同步哈希在启动时绑定）。
+- **热重载**：文件被监控；语法/校验错误会保留上一份好配置并在 `memory_api_status` 中显示错误。
+- **优先级**：配置文件的 `embeddings` 端点覆盖 profile 里的 `embeddingUrl/embeddingModel/embeddingDimension/embeddingApiKeyEnv`；`distillation` 端点在 profile 未显式设置 `distillationProvider` 时接管 LLM 蒸馏与 `memory_consolidate`。
+- **自查**：`memory_api_status` 工具返回加载状态、端点清单（含 key 来源与代理决策，全部脱敏），`reload: true` 可手动重读。
 
 ### 混合检索与可选向量索引
 
@@ -77,7 +130,7 @@ dsh plugin --profile <profile> add <path-to-this-repository>
 
 DSH 通过 `dsh.bundle.patch` 自动将 `reasoning-memory` 插件行加入 profile。需要本机可调用 Python 3.10 或更高版本；Windows 默认命令为 `python`，其他平台默认 `python3`，可在 Cordis 插件配置中设置 `pythonExecutable`。配置项还包括 `maxMemories`、`maxRetrievalRecords`、`maxTrajectoryEvents` 和 `positiveNegativeRatio`。
 
-推理捕获与蒸馏的可选配置：`captureReasoningEnabled`（默认关闭；开启后 `assistant/message` 的 reasoning 内容块与 token usage 仅暂存在内存，`memory_end_task` 汇总返回，不持久化）、`maxReasoningTextChars`（默认 4000）、`llmDistillationEnabled`、`llmDistillationTemperature`（默认 1.0）、`distillationProvider`/`distillationModel`（留空时复用本任务捕获的模型）、`maxMemoryItemsPerOutcome`（1–3，默认 3）、`deSpecificationThreshold`（默认 0.9）、`relevanceThreshold`（默认 0）、`memoryConsolidationEnabled`。蒸馏与整合通过 `ctx.get('llm')` 使用 DSH llm 服务；服务缺失、模型未配置或调用失败时自动回退到调用者提交的 insight 路径。
+推理捕获与蒸馏的可选配置：`captureReasoningEnabled`（默认关闭；开启后 `assistant/message` 的 reasoning 内容块与 token usage 仅暂存在内存，`memory_end_task` 汇总返回，不持久化）、`maxReasoningTextChars`（默认 4000）、`llmDistillationEnabled`、`llmDistillationTemperature`（默认 1.0）、`distillationProvider`/`distillationModel`（留空时复用本任务捕获的模型，或使用 API 配置文件的 `distillation` 端点）、`maxMemoryItemsPerOutcome`（1–3，默认 3）、`deSpecificationThreshold`（默认 0.9）、`relevanceThreshold`（默认 0）、`memoryConsolidationEnabled`、`apiConfigPath`（用户 API 端点配置文件路径，见上文）。蒸馏与整合优先走 API 配置文件的端点，其次通过 `ctx.get('llm')` 使用 DSH llm 服务；全部不可用时自动回退到调用者提交的 insight 路径。
 
 向量检索的可选配置示例（其余 DSH profile 字段依开发文档提供）：
 
@@ -95,16 +148,28 @@ reasoning-memory:
   vectorCandidatePoolSize: 100
 ```
 
-`embeddingUrl` 必须返回 OpenAI embeddings 兼容的 `{data:[{index,embedding}]}` 结构，维度须与 `embeddingDimension` 和 Qdrant collection 相同。API key 从所配置的环境变量读取，不写入 profile。关闭 `vectorIndexEnabled` 时不会调用 Qdrant 或 embedding 服务，仍使用本地 BM25 与 Python 排序。
+`embeddingUrl` 必须返回 OpenAI embeddings 兼容的 `{data:[{index,embedding}]}` 结构，维度须与 `embeddingDimension` 和 Qdrant collection / 内置库表相同。API key 从所配置的环境变量读取，不写入 profile。关闭 `vectorIndexEnabled` 与 `builtinStoreEnabled` 时不会调用 Qdrant 或 embedding 服务，仍使用本地 BM25 与 Python 排序。
 
-## 本地测试
+内置库的可选配置示例：
 
-在仓库根目录运行 `npm test`，依次执行 TypeScript 构建、Python 核心 `unittest` 和 Node 检索索引测试；也可分别运行 `npm run test:python` 与 `npm run test:node`。Node 用例通过 mock HTTP 验证 Qdrant/embedding REST 请求，不要求本机启动服务。`test/` 目录按团队要求加入 `.gitignore`，测试用例不会随 Git 提交或推送；克隆仓库后若没有本地测试目录，需从团队本地测试包恢复后再运行。
+```yaml
+reasoning-memory:
+  builtinStoreEnabled: true
+  builtinStoreDataDir: .reasoning-memory-data   # 留空 = 纯内存（每次启动从 storageDomain 重建）
+```
+
+## 本地测试与 CI/CD
+
+在仓库根目录运行 `npm test`，依次执行 TypeScript 构建、Python 核心 `unittest` 和 Node 测试；也可分别运行 `npm run test:python`、`npm run test:node`（索引/内置库/API 配置 + 插件部署冒烟）。Node 用例通过 mock HTTP 验证 Qdrant/embedding REST 请求，并通过真实进程内 PGlite（含 pgvector/HNSW）验证内置库的同步、向量检索、结构化查询与降级，不要求本机启动任何服务。测试用例已随仓库提交（早期 `.gitignore` 排除测试的约定已解除，CI 需要测试入库）。
+
+- **CI**（`.github/workflows/ci.yml`）：push/PR 在 ubuntu 与 windows 双平台跑构建、Python 31 项与全部 Node 测试（含插件部署冒烟测试——用 mock Cordis 宿主加载打包产物、驱动完整记忆生命周期、跑真实 Python worker 与进程内 PGlite）。
+- **CD**（`.github/workflows/cd.yml`）：tag `v*` 或手动触发时构建测试 → `npm pack` 打包 → 校验发货 tarball 内容（`npm run verify:bundle`）→ **部署冒烟**：解包后从 tarball 内的 `dist/index.js` 引导插件（`PLUGIN_BUNDLE_ENTRY` 指向解包产物），证明发货包在 DSH 宿主之外即可安装部署。真实 `dsh plugin add` 安装仍为手动步骤（DSH 桌面运行时未在 runner 上无头安装）。
+- Python 桥接在受限环境（沙箱/服务上下文）自动降级：管道 stdio 被拒（EPERM）时切换为 `--file-io` 临时文件传输。
 
 ## 模型侧生命周期
 
 1. `memory_begin_task` 开始任务并返回 `task_id`。每个 DSH session 同一时间只接受一个活跃任务。
-2. 需要时调用 `memory_retrieve`。结果含策略内容、前提、成功/失败标签、分路分数、信任等级和事件来源；把它当作参考证据，并在当前环境重新验证。
+2. 需要时调用 `memory_retrieve`。结果含策略内容、前提、成功/失败标签、分路分数、信任等级和事件来源；把它当作参考证据，并在当前环境重新验证。也可以用 `memory_query` 按 outcome/类型/信任等级/任务范围做结构化查询（审计、去重、缩小候选）。
 3. 可选调用 `memory_feedback`，只提交当前任务检索到且调用者确认实际用过的记忆；给出短证据，但插件不会保存证据文本或独立核实评价。
 4. 调用 `memory_save_outcome`，提交 outcome、verifier、evidence；成功时还要提交一句可迁移的 reasoning insight，失败时只在归因明确时提交 failure_mode。也可以提交最多 3 条结构化 `memory_items`（title/description/content/contraindications），或当 profile 开启 `llmDistillationEnabled` 时让插件对捕获轨迹做 LLM 蒸馏（`distill_with_llm: false` 可单次关闭；复用本任务所用模型，除非显式配置 `distillationProvider`/`distillationModel`）。
 5. 调用 `memory_end_task` 清理活动轨迹。若没有 outcome 或失败无法归因，不会写入伪造的记忆条目。

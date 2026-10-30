@@ -14,7 +14,14 @@ import {
 import { runReasoningCore } from './python.js'
 import { LexicalMemoryIndex } from './lexical-index.js'
 import { QdrantMemoryIndex } from './vector-index.js'
+import {
+  BuiltinMemoryStore,
+  type BuiltinStoreStatus,
+  type StructuredMemoryRow,
+  type StructuredQueryFilter,
+} from './builtin-store.js'
 import { EnterpriseRuleRag, type EnterpriseRule } from './enterprise-rules-rag.js'
+import { ApiConfigService } from './api-config.js'
 import {
   type ConsolidateExperience,
   type DistilledMemoryItem,
@@ -70,6 +77,9 @@ export interface Config {
   deSpecificationThreshold?: number
   relevanceThreshold?: number
   memoryConsolidationEnabled?: boolean
+  builtinStoreEnabled?: boolean
+  builtinStoreDataDir?: string
+  apiConfigPath?: string
 }
 
 const defaultPython = process.platform === 'win32' ? 'python' : 'python3'
@@ -112,6 +122,9 @@ export const Config: z<Config> = z.object({
   deSpecificationThreshold: z.number().min(0).max(1).default(0.9),
   relevanceThreshold: z.number().min(0).max(1).default(0),
   memoryConsolidationEnabled: z.boolean().default(false),
+  builtinStoreEnabled: z.boolean().default(false),
+  builtinStoreDataDir: z.string().default(''),
+  apiConfigPath: z.string().default(''),
 })
 
 type Route = 'auto' | 'semantic' | 'structure' | 'graph' | 'hybrid'
@@ -351,12 +364,107 @@ const CONSOLIDATE_OUTPUT_SCHEMA = {
   },
 } as const
 
+const MEMORY_QUERY_OUTPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    count: { type: 'integer', required: true },
+    items: {
+      type: 'array', required: true,
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          memoryId: { type: 'string', required: true },
+          type: { type: 'string', required: true },
+          outcome: { type: 'string', required: true },
+          taskScope: { type: 'string', required: true },
+          title: { type: 'string', required: true },
+          description: { type: 'string', required: true },
+          content: { type: 'string', required: true },
+          reasoning: { type: 'string', required: true },
+          preconditions: { type: 'array', required: true, items: { type: 'string' } },
+          contraindications: { type: 'array', required: true, items: { type: 'string' } },
+          structureSignature: { type: 'array', required: true, items: { type: 'string' } },
+          trustLevel: { type: 'string', required: true },
+          confidence: { type: 'number', required: true },
+          feedback: {
+            type: 'object', required: true, additionalProperties: false,
+            properties: {
+              helpful: { type: 'integer', required: true },
+              harmful: { type: 'integer', required: true },
+              neutral: { type: 'integer', required: true },
+            },
+          },
+          provenance: {
+            type: 'object', required: true, additionalProperties: false,
+            properties: {
+              taskId: { type: 'string', required: true },
+              sourceSessionId: { type: 'string', required: true },
+              eventSeqs: { type: 'array', required: true, items: { type: 'integer' } },
+            },
+          },
+          evidence: {
+            type: 'object', required: true, additionalProperties: false,
+            properties: {
+              verifier: { type: 'string', required: true },
+              summary: { type: 'string', required: true },
+              independentlyVerified: { type: 'boolean', required: true },
+            },
+          },
+          createdAt: { type: 'number', required: true },
+          updatedAt: { type: 'number', required: true },
+          semanticText: { type: 'string', required: true },
+          extractionMethod: { type: 'string', required: true },
+          distillationModel: { type: 'string', required: true },
+          sourceMemoryIds: { type: 'array', required: true, items: { type: 'string' } },
+        },
+      },
+    },
+    note: { type: 'string', required: true },
+  },
+} as const
+
 const FEEDBACK_OUTPUT_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   properties: {
     updated: { type: 'integer', required: true },
     skipped: { type: 'integer', required: true },
+    note: { type: 'string', required: true },
+  },
+} as const
+
+const API_STATUS_OUTPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    enabled: { type: 'boolean', required: true },
+    path: { type: 'string', required: true },
+    loaded: { type: 'boolean', required: true },
+    lastError: { type: 'string', required: true },
+    proxy: {
+      type: 'object', required: true, additionalProperties: false,
+      properties: {
+        url: { type: 'string', required: true },
+        noProxy: { type: 'array', required: true, items: { type: 'string' } },
+      },
+    },
+    endpoints: {
+      type: 'array', required: true,
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          name: { type: 'string', required: true },
+          kind: { type: 'string', required: true, enum: ['openai-embeddings', 'openai-chat', 'http-json'] },
+          baseUrl: { type: 'string', required: true },
+          model: { type: 'string' },
+          dimension: { type: 'number' },
+          temperature: { type: 'number' },
+          keySource: { type: 'string', required: true, enum: ['env', 'inline', 'none'] },
+          proxy: { type: 'string', required: true, enum: ['inherit', 'direct', 'custom'] },
+        },
+      },
+    },
     note: { type: 'string', required: true },
   },
 } as const
@@ -411,22 +519,52 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const activeBySession = new Map<string, ActiveTask>()
   const activeByTaskId = new Map<string, ActiveTask>()
   const ignoredMemoryCalls = new Map<string, Set<string>>()
+
+  // User-editable API endpoint configuration. When the profile sets
+  // apiConfigPath, endpoints declared there override the profile-level
+  // embedding settings and can drive LLM distillation directly. The shared
+  // fetch routes every adapter through the configured proxy (hot-applied);
+  // endpoint model/dimension changes take effect on restart.
+  let apiConfig: ApiConfigService | undefined
+  if (config.apiConfigPath!.trim()) {
+    apiConfig = new ApiConfigService(config.apiConfigPath!.trim(), ctx.logger)
+    apiConfig.start()
+  }
+  const apiFetch: typeof fetch = apiConfig ? apiConfig.fetchFn : fetch
+  const embeddingInputs = (): { url: string; model: string; key?: string; dimension: number } => {
+    const configured = apiConfig?.embeddingOptions('embeddings')
+    if (configured) {
+      return {
+        url: configured.embeddingUrl,
+        model: configured.embeddingModel,
+        key: configured.embeddingApiKey,
+        dimension: configured.embeddingDimension,
+      }
+    }
+    return {
+      url: config.embeddingUrl!,
+      model: config.embeddingModel!,
+      key: process.env[config.embeddingApiKeyEnv!] || undefined,
+      dimension: config.embeddingDimension!,
+    }
+  }
+  const embeddings = embeddingInputs()
   let vectorIndex: QdrantMemoryIndex | undefined
   let vectorIndexDegraded = false
   let vectorIndexSynchronized = !config.vectorIndexEnabled
   let vectorIndexReady: Promise<void> = Promise.resolve()
-  if (config.vectorIndexEnabled) {
+  if (config.vectorIndexEnabled && !config.builtinStoreEnabled) {
     try {
       vectorIndex = new QdrantMemoryIndex({
         qdrantUrl: config.qdrantUrl!,
         collection: config.qdrantCollection!,
         qdrantApiKey: process.env[config.qdrantApiKeyEnv!] || undefined,
-        embeddingUrl: config.embeddingUrl!,
-        embeddingModel: config.embeddingModel!,
-        embeddingApiKey: process.env[config.embeddingApiKeyEnv!] || undefined,
-        embeddingDimension: config.embeddingDimension!,
+        embeddingUrl: embeddings.url,
+        embeddingModel: embeddings.model,
+        embeddingApiKey: embeddings.key,
+        embeddingDimension: embeddings.dimension,
         candidatePoolSize: Math.floor(config.vectorCandidatePoolSize!),
-      })
+      }, apiFetch)
       const existingMemories = [...memories.entries()].map(([, item]) => item)
       vectorIndexReady = vectorIndex.synchronize(existingMemories).then(() => {
         vectorIndexSynchronized = true
@@ -436,6 +574,103 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     } catch {
       vectorIndexDegraded = true
     }
+  }
+
+  // Built-in PostgreSQL (PGlite) + pgvector store: structured JSON rows with
+  // dense embeddings and HNSW. It takes over the vector-recall role from the
+  // external Qdrant index when enabled; storageDomain stays canonical and the
+  // store re-syncs from it by dual content hashes.
+  let builtinStore: BuiltinMemoryStore | undefined
+  let builtinStoreStatus: BuiltinStoreStatus = 'disabled'
+  let builtinStoreReady: Promise<void> = Promise.resolve()
+  if (config.builtinStoreEnabled) {
+    if (config.vectorIndexEnabled) {
+      ctx.logger.warn('reasoning-memory: builtinStoreEnabled and vectorIndexEnabled are both on; the built-in store owns vector retrieval and the Qdrant index stays idle.')
+    }
+    try {
+      builtinStore = new BuiltinMemoryStore({
+        dataDir: config.builtinStoreDataDir!.trim() || undefined,
+        embeddingUrl: embeddings.url,
+        embeddingModel: embeddings.model,
+        embeddingApiKey: embeddings.key,
+        embeddingDimension: embeddings.dimension,
+        candidatePoolSize: Math.floor(config.vectorCandidatePoolSize!),
+      }, apiFetch)
+      builtinStoreStatus = 'initializing'
+      const existingMemories = [...memories.entries()].map(([, item]) => item)
+      builtinStoreReady = builtinStore.synchronize(existingMemories).then((result) => {
+        builtinStoreStatus = result.hasEmbeddings ? 'ready' : 'json-only'
+      }).catch(() => {
+        builtinStoreStatus = 'degraded'
+      })
+    } catch {
+      builtinStoreStatus = 'degraded'
+    }
+  }
+
+  // Fire-and-forget write-through into the built-in store. The canonical
+  // storageDomain write has already succeeded; a store failure only degrades
+  // the derived index.
+  const builtinWrite = (operation: (store: BuiltinMemoryStore) => Promise<void>): void => {
+    if (!builtinStore) return
+    void builtinStoreReady.then(async () => {
+      if (!builtinStore || builtinStoreStatus === 'degraded') return
+      try {
+        await operation(builtinStore)
+      } catch {
+        builtinStoreStatus = 'degraded'
+      }
+    })
+  }
+
+  // Canonical-store scan used when the built-in store is disabled, degraded,
+  // or still initializing. Applies the exact same typed filter semantics as
+  // BuiltinMemoryStore.queryStructured so both sources answer identically.
+  const scanMemories = (filter: StructuredQueryFilter): StructuredMemoryRow[] => {
+    const limit = Math.max(1, Math.min(100, filter.limit || 20))
+    const offset = Math.max(0, filter.offset || 0)
+    const sortKey = filter.sortBy === 'confidence' ? 'confidence'
+      : filter.sortBy === 'updated_at' ? 'updatedAt'
+      : 'createdAt'
+    const direction = filter.sortOrder === 'asc' ? 1 : -1
+    const rows = [...memories.entries()]
+      .map(([, item]) => item)
+      .filter(item =>
+        (!filter.outcome || item.outcome === filter.outcome)
+        && (!filter.type || item.type === filter.type)
+        && (!filter.trustLevel || item.trustLevel === filter.trustLevel)
+        && (!filter.taskScope || (item.taskScope || '').includes(filter.taskScope)))
+      .sort((left, right) => {
+        const difference = (Number(left[sortKey] ?? 0) - Number(right[sortKey] ?? 0)) * direction
+        return difference !== 0 ? difference : left.memoryId.localeCompare(right.memoryId)
+      })
+      .slice(offset, offset + limit)
+    return rows.map(item => ({
+      memoryId: item.memoryId,
+      type: item.type,
+      outcome: item.outcome,
+      taskScope: item.taskScope,
+      preconditions: item.preconditions ?? [],
+      content: item.content,
+      reasoning: item.reasoning ?? '',
+      title: item.title ?? '',
+      description: item.description ?? '',
+      contraindications: item.contraindications ?? [],
+      reasoningGraph: item.reasoningGraph ?? { version: 1, nodes: [], edges: [] },
+      feedback: item.feedback ?? { helpful: 0, harmful: 0, neutral: 0 },
+      provenance: item.provenance,
+      evidence: item.evidence,
+      confidence: item.confidence,
+      trustLevel: item.trustLevel,
+      extractorVersion: item.extractorVersion,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+      semanticText: item.semanticText,
+      structureSignature: item.structureSignature,
+      extractionMethod: item.extractionMethod ?? 'caller_insight',
+      distillationModel: item.distillationModel ?? '',
+      sourceMemoryIds: item.sourceMemoryIds ?? [],
+    }))
   }
   let enterpriseRuleRag: EnterpriseRuleRag | undefined
   let enterpriseRuleRagInitError = ''
@@ -447,28 +682,34 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (!ruleCollection) throw new Error('enterpriseRuleCollection cannot be empty')
       const ruleDimension = config.enterpriseRuleEmbeddingDimension! > 0
         ? config.enterpriseRuleEmbeddingDimension!
-        : config.embeddingDimension!
+        : embeddings.dimension
       enterpriseRuleRag = new EnterpriseRuleRag({
         qdrantUrl: config.qdrantUrl!,
         collection: ruleCollection,
         qdrantApiKey: process.env[config.enterpriseRuleQdrantApiKeyEnv!] || undefined,
-        embeddingUrl: config.enterpriseRuleEmbeddingUrl!.trim() || config.embeddingUrl!,
-        embeddingModel: config.enterpriseRuleEmbeddingModel!.trim() || config.embeddingModel!,
+        embeddingUrl: config.enterpriseRuleEmbeddingUrl!.trim() || embeddings.url,
+        embeddingModel: config.enterpriseRuleEmbeddingModel!.trim() || embeddings.model,
         embeddingApiKey: process.env[config.enterpriseRuleEmbeddingApiKeyEnv!]
-          || process.env[config.embeddingApiKeyEnv!]
+          || embeddings.key
           || undefined,
         embeddingDimension: ruleDimension,
         ruleSetId,
         candidatePoolSize: Math.floor(config.enterpriseRuleCandidatePoolSize!),
         resultLimit: Math.floor(config.enterpriseRuleResultLimit!),
         scoreThreshold: config.enterpriseRuleScoreThreshold!,
-      })
+      }, apiFetch)
     } catch (error) {
       enterpriseRuleRagInitError = error instanceof Error ? error.message : 'enterprise rule RAG configuration is invalid'
     }
   }
 
-  ctx.effect(() => () => domain.close())
+  ctx.effect(() => () => {
+    domain.close()
+    apiConfig?.stop()
+    // Awaitable shutdown: hosts that honor disposer promises get a clean
+    // PGlite teardown; hosts that ignore them keep the fire-and-forget path.
+    return builtinStore ? builtinStore.close().catch(() => {}) : undefined
+  })
 
   ctx.on('session/event', (session: Session, event: SessionEvent) => {
     const sessionId = getSessionId(session)
@@ -663,7 +904,31 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           candidate.memoryId,
           { lexicalScore: candidate.lexicalScore, vectorScore: 0 },
         ]))
-        if (vectorIndex && (route === 'auto' || route === 'hybrid')) {
+        if (builtinStore && (route === 'auto' || route === 'hybrid')) {
+          if (builtinStoreStatus === 'degraded') {
+            vectorWarning = 'The built-in PostgreSQL/vector store could not be initialized; BM25 retrieval was used.'
+          } else if (builtinStoreStatus === 'initializing') {
+            vectorWarning = 'The built-in store is still synchronizing; BM25 retrieval was used.'
+          } else if (builtinStoreStatus === 'json-only') {
+            vectorWarning = 'The built-in store has structured rows but no embeddings; BM25 retrieval was used.'
+          } else {
+            try {
+              const builtinCandidates = await builtinStore.search(
+                query,
+                queryGraphJson,
+                active?.taskId ?? '',
+              )
+              for (const candidate of builtinCandidates) {
+                const current = candidateScores.get(candidate.memoryId) ?? { lexicalScore: 0, vectorScore: 0 }
+                current.vectorScore = Math.max(current.vectorScore, candidate.vectorScore)
+                candidateScores.set(candidate.memoryId, current)
+              }
+            } catch {
+              builtinStoreStatus = 'degraded'
+              vectorWarning = 'Built-in vector search failed; BM25 retrieval was used.'
+            }
+          }
+        } else if (vectorIndex && (route === 'auto' || route === 'hybrid')) {
           if (vectorIndexDegraded) {
             vectorWarning = 'Vector index could not be synchronized; BM25 retrieval was used.'
           } else if (!vectorIndexSynchronized) {
@@ -894,6 +1159,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         if (!item) continue
         const next = memoryItemSchema.parse({ ...item, feedback: update.feedback, updatedAt: Date.now() })
         await memories.put(update.memoryId, next)
+        builtinWrite(store => store.upsert(next))
         active.feedbackMemoryIds.add(update.memoryId)
         updated++
       }
@@ -977,37 +1243,65 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (args.distill_with_llm === true && !config.llmDistillationEnabled) {
         distillationNote = 'LLM distillation was requested but the profile disables llmDistillationEnabled; the caller-provided insight is used instead.'
       } else if (!items && wantLlm && admittedOutcome) {
-        const llm = ctx.get('llm') as LlmRuntime | undefined
-        const provider = config.distillationProvider!.trim() || active.capturedModel?.provider || ''
-        const model = config.distillationModel!.trim() || active.capturedModel?.model || ''
-        if (!llm) {
-          distillationNote = 'LLM distillation was requested but the llm service is unavailable; the caller-provided insight is used instead.'
-        } else if (!provider || !model) {
-          distillationNote = 'LLM distillation was requested but no distillation model is configured and no task model was captured; the caller-provided insight is used instead.'
-        } else {
+        const actions = active.events
+          .filter(event => event.type === 'tool_result')
+          .map(event => event.toolName ? `${event.toolName}${event.success === false ? ' (failed)' : ''}` : '(unnamed tool)')
+          .join(' → ')
+        const systemPrompt = distillSystemPrompt(admittedOutcome, config.maxMemoryItemsPerOutcome!)
+        const userPrompt = distillUserText({ query: active.semanticText, actions, evidence, reasoningText: active.reasoningText }, admittedOutcome)
+        // API-config route first when the profile left the DSH distillation
+        // model unset: the user's own chat endpoint handles distillation.
+        const apiChatAvailable = !config.distillationProvider!.trim()
+          && apiConfig?.endpointKind('distillation') === 'openai-chat'
+        if (apiChatAvailable && apiConfig) {
           try {
-            const actions = active.events
-              .filter(event => event.type === 'tool_result')
-              .map(event => event.toolName ? `${event.toolName}${event.success === false ? ' (failed)' : ''}` : '(unnamed tool)')
-              .join(' → ')
-            const parsed = await distillWithLlm(
-              llm,
-              provider,
-              model,
-              distillSystemPrompt(admittedOutcome, config.maxMemoryItemsPerOutcome!),
-              distillUserText({ query: active.semanticText, actions, evidence, reasoningText: active.reasoningText }, admittedOutcome),
+            const text = await apiConfig.openAiChat(
+              'distillation',
+              systemPrompt,
+              userPrompt,
               config.llmDistillationTemperature!,
               exec.signal,
             )
+            const parsed = parseMemoryItems(text, false)
             if (parsed.length === 0) {
-              distillationNote = 'LLM distillation produced no parseable memory items; the caller-provided insight is used instead.'
+              distillationNote = 'API-config distillation produced no parseable memory items; the caller-provided insight is used instead.'
             } else {
               items = parsed.map(item => ({ ...item, outcome: admittedOutcome }))
               extractionMethod = 'llm_distillation'
-              distillationModel = model
+              distillationModel = apiConfig.chatOptions('distillation')?.model ?? 'api-config:distillation'
             }
           } catch (error) {
-            distillationNote = `LLM distillation failed (${error instanceof Error ? error.message : String(error)}); the caller-provided insight is used instead.`
+            distillationNote = `API-config distillation failed (${error instanceof Error ? error.message : String(error)}); the caller-provided insight is used instead.`
+          }
+        } else {
+          const llm = ctx.get('llm') as LlmRuntime | undefined
+          const provider = config.distillationProvider!.trim() || active.capturedModel?.provider || ''
+          const model = config.distillationModel!.trim() || active.capturedModel?.model || ''
+          if (!llm) {
+            distillationNote = 'LLM distillation was requested but the llm service is unavailable; the caller-provided insight is used instead.'
+          } else if (!provider || !model) {
+            distillationNote = 'LLM distillation was requested but no distillation model is configured and no task model was captured; the caller-provided insight is used instead.'
+          } else {
+            try {
+              const parsed = await distillWithLlm(
+                llm,
+                provider,
+                model,
+                systemPrompt,
+                userPrompt,
+                config.llmDistillationTemperature!,
+                exec.signal,
+              )
+              if (parsed.length === 0) {
+                distillationNote = 'LLM distillation produced no parseable memory items; the caller-provided insight is used instead.'
+              } else {
+                items = parsed.map(item => ({ ...item, outcome: admittedOutcome }))
+                extractionMethod = 'llm_distillation'
+                distillationModel = model
+              }
+            } catch (error) {
+              distillationNote = `LLM distillation failed (${error instanceof Error ? error.message : String(error)}); the caller-provided insight is used instead.`
+            }
           }
         }
       }
@@ -1046,6 +1340,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       for (const item of storedItems) {
         await memories.put(item.memoryId, item)
         lexicalIndex.upsert(item)
+        builtinWrite(store => store.upsert(item))
       }
       const overflow = memories.size - config.maxMemories!
       const expiredIds: string[] = []
@@ -1058,6 +1353,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           expiredIds.push(key)
         }
         lexicalIndex.delete(expiredIds)
+        builtinWrite(store => store.delete(expiredIds))
       }
       if (vectorIndex && !vectorIndexDegraded) {
         void vectorIndexReady.then(async () => {
@@ -1083,7 +1379,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   ctx.tools.register(defineTool({
     name: 'memory_consolidate',
-    description: 'Distill several reasoning memories from repeated attempts of the same kind of task into higher-quality transferable strategies via self-contrast reasoning (Memory-aware Test-Time Scaling). Success and failure experiences are compared together; each new item is labeled success or fail and stored as unverified. The source memories stay in the bank. Requires the profile to enable memoryConsolidationEnabled and a configured distillation provider/model.',
+    description: 'Distill several reasoning memories from repeated attempts of the same kind of task into higher-quality transferable strategies via self-contrast reasoning (Memory-aware Test-Time Scaling). Success and failure experiences are compared together; each new item is labeled success or fail and stored as unverified. The source memories stay in the bank. Requires the profile to enable memoryConsolidationEnabled plus either a distillationProvider/distillationModel pair or a distillation endpoint in the API config file.',
     parameters: {
       memory_ids: { type: 'array', required: true, items: { type: 'string' }, description: '2 to 10 memory IDs from repeated attempts of the same task kind (retrieved or saved earlier).' },
       goal: { type: 'string', description: 'Optional shared task description used as the consolidated context.' },
@@ -1092,11 +1388,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     async execute(args, exec) {
       const notApplicable = (reason: string) => ({ stored: false as const, reason, memoryIds: [], trustLevel: 'not-applicable' as const })
       if (!config.memoryConsolidationEnabled) return notApplicable('memory_consolidate is disabled in this profile; set memoryConsolidationEnabled.')
+      const apiChatAvailable = apiConfig?.endpointKind('distillation') === 'openai-chat'
       const llm = ctx.get('llm') as LlmRuntime | undefined
-      if (!llm) return notApplicable('memory_consolidate requires the llm service, which is unavailable in this profile.')
+      if (!apiChatAvailable && !llm) return notApplicable('memory_consolidate requires the llm service or a distillation endpoint in the API config file.')
       const provider = config.distillationProvider!.trim()
       const model = config.distillationModel!.trim()
-      if (!provider || !model) return notApplicable('memory_consolidate requires distillationProvider and distillationModel in the plugin profile.')
+      if (!apiChatAvailable && (!provider || !model)) return notApplicable('memory_consolidate requires distillationProvider and distillationModel in the plugin profile, or a distillation endpoint in the API config file.')
       const ids = [...new Set(args.memory_ids)].slice(0, 10)
       if (ids.length < 2) return notApplicable('provide at least two distinct memory IDs from repeated attempts of the same task kind.')
       const sources = ids
@@ -1115,22 +1412,30 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const goal = clipText(args.goal ?? '', 4000)
 
       let parsed: DistilledMemoryItem[]
+      let usedModel = ''
       try {
         const system = consolidateSystemPrompt(config.maxMemoryItemsPerOutcome!)
         const user = consolidateUserText(goal, experiences)
-        const prepared = await llm.prepareCall({ provider, model, temperature: config.llmDistillationTemperature! }, exec.signal)
-        const message = createUserMessage({
-          content: [{ type: 'text', text: user }],
-          source: { kind: 'plugin', plugin: 'reasoning-memory' },
-        })
-        const text = await collectStreamText(prepared.stream({
-          provider: prepared.config.provider,
-          model: prepared.config.model,
-          temperature: prepared.config.temperature,
-          messages: [message],
-          system,
-          signal: exec.signal,
-        }))
+        let text: string
+        if (apiChatAvailable && apiConfig) {
+          text = await apiConfig.openAiChat('distillation', system, user, config.llmDistillationTemperature!, exec.signal)
+          usedModel = apiConfig.chatOptions('distillation')?.model ?? 'api-config:distillation'
+        } else {
+          const prepared = await llm!.prepareCall({ provider, model, temperature: config.llmDistillationTemperature! }, exec.signal)
+          const message = createUserMessage({
+            content: [{ type: 'text', text: user }],
+            source: { kind: 'plugin', plugin: 'reasoning-memory' },
+          })
+          text = await collectStreamText(prepared.stream({
+            provider: prepared.config.provider,
+            model: prepared.config.model,
+            temperature: prepared.config.temperature,
+            messages: [message],
+            system,
+            signal: exec.signal,
+          }))
+          usedModel = model
+        }
         parsed = parseMemoryItems(text, true)
       } catch (error) {
         return notApplicable(`memory consolidation failed: ${error instanceof Error ? error.message : String(error)}`)
@@ -1151,7 +1456,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         failureMode: '',
         reasoningGraphJson: '',
         extractionMethod: 'llm_self_contrast' as const,
-        distillationModel: model,
+        distillationModel: usedModel,
         sourceMemoryIds: ids,
         items: parsed,
         maxItemsPerOutcome: config.maxMemoryItemsPerOutcome,
@@ -1165,6 +1470,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       for (const item of storedItems) {
         await memories.put(item.memoryId, item)
         lexicalIndex.upsert(item)
+        builtinWrite(store => store.upsert(item))
       }
       const overflow = memories.size - config.maxMemories!
       const expiredIds: string[] = []
@@ -1177,6 +1483,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           expiredIds.push(key)
         }
         lexicalIndex.delete(expiredIds)
+        builtinWrite(store => store.delete(expiredIds))
       }
       if (vectorIndex && !vectorIndexDegraded) {
         void vectorIndexReady.then(async () => {
@@ -1194,6 +1501,95 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         reason: `stored ${storedItems.length} unverified consolidated memories distilled from ${sources.length} source memories; the sources remain in the bank.`,
         memoryIds: storedItems.map(item => item.memoryId),
         trustLevel: 'unverified' as const,
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'memory_query',
+    description: 'Query the structured memory bank with safe typed filters (no SQL). Returns stored reasoning memories as structured JSON rows. Use it for audits, dedup checks, or narrowing candidates by outcome, memory type, trust level, or task scope before retrieval. Memories remain unverified data.',
+    parameters: {
+      outcome: { type: 'string', enum: ['success', 'fail'], description: 'Only success or failure memories.' },
+      type: { type: 'string', enum: ['strategy', 'structure', 'failure'], description: 'Only this memory type.' },
+      trust_level: { type: 'string', enum: ['verified', 'unverified', 'unknown'], description: 'Only this trust level.' },
+      task_scope: { type: 'string', description: 'Substring filter on the task family/scope label.' },
+      limit: { type: 'integer', description: 'Max rows (default 20, max 100).' },
+      offset: { type: 'integer', description: 'Skip this many rows (default 0).' },
+      sort_by: { type: 'string', enum: ['created_at', 'updated_at', 'confidence'], description: 'Sort field (default created_at).' },
+      sort_order: { type: 'string', enum: ['asc', 'desc'], description: 'Sort direction (default desc).' },
+    },
+    output: { schema: MEMORY_QUERY_OUTPUT_SCHEMA, render: renderJson },
+    async execute(args) {
+      const filter: StructuredQueryFilter = {
+        outcome: args.outcome as StructuredQueryFilter['outcome'],
+        type: args.type as StructuredQueryFilter['type'],
+        trustLevel: args.trust_level as StructuredQueryFilter['trustLevel'],
+        taskScope: typeof args.task_scope === 'string' && args.task_scope.trim()
+          ? clipText(args.task_scope, 200)
+          : undefined,
+        limit: Math.floor(args.limit ?? 20),
+        offset: Math.floor(args.offset ?? 0),
+        sortBy: (args.sort_by as StructuredQueryFilter['sortBy']) ?? 'created_at',
+        sortOrder: (args.sort_order as StructuredQueryFilter['sortOrder']) ?? 'desc',
+      }
+      let items: StructuredMemoryRow[]
+      let note: string
+      if (builtinStore && builtinStoreStatus === 'ready') {
+        try {
+          items = await builtinStore.queryStructured(filter)
+          note = 'Rows were returned by the built-in PostgreSQL store.'
+        } catch {
+          items = scanMemories(filter)
+          note = 'The built-in store query failed; rows were scanned from the canonical memory store.'
+        }
+      } else if (builtinStore && builtinStoreStatus === 'json-only') {
+        try {
+          items = await builtinStore.queryStructured(filter)
+          note = 'Rows were returned by the built-in PostgreSQL store (embeddings are unavailable in this profile).'
+        } catch {
+          items = scanMemories(filter)
+          note = 'The built-in store query failed; rows were scanned from the canonical memory store.'
+        }
+      } else if (builtinStoreStatus === 'degraded') {
+        items = scanMemories(filter)
+        note = 'The built-in store is degraded; rows were scanned from the canonical memory store.'
+      } else if (builtinStoreStatus === 'initializing') {
+        items = scanMemories(filter)
+        note = 'The built-in store is still synchronizing; rows were scanned from the canonical memory store.'
+      } else {
+        items = scanMemories(filter)
+        note = 'The built-in store is disabled in this profile; rows were scanned from the canonical memory store.'
+      }
+      return { count: items.length, items, note }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'memory_api_status',
+    description: 'Report the loaded API endpoint configuration (from apiConfigPath). Names, kinds, models, key SOURCES, and proxy settings are shown; API key values and proxy credentials are always masked. Pass reload to re-read the config file before reporting.',
+    parameters: {
+      reload: { type: 'boolean', description: 'Re-read the API config file before reporting (default false).' },
+    },
+    output: { schema: API_STATUS_OUTPUT_SCHEMA, render: renderJson },
+    async execute(args) {
+      if (!apiConfig) {
+        return {
+          enabled: false,
+          path: '',
+          loaded: false,
+          lastError: '',
+          proxy: { url: '', noProxy: [] },
+          endpoints: [],
+          note: 'No apiConfigPath is set in the plugin profile; add one to declare user-configured API endpoints (embeddings, distillation, generic HTTP).',
+        }
+      }
+      if (args.reload) apiConfig.reload()
+      return {
+        enabled: true,
+        ...apiConfig.status(),
+        note: apiConfig.loaded
+          ? 'The configuration is active. Proxy and key edits hot-apply; model/dimension changes require a plugin restart (the vector store schema binds them at startup).'
+          : 'The configuration could not be loaded; see lastError. The previous good configuration stays active if one was loaded.',
       }
     },
   }))
