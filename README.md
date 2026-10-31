@@ -75,6 +75,16 @@ endpoints:                # 命名端点；插件按名字引用，按 kind 校�
 - **优先级**：配置文件的 `embeddings` 端点覆盖 profile 里的 `embeddingUrl/embeddingModel/embeddingDimension/embeddingApiKeyEnv`；`distillation` 端点在 profile 未显式设置 `distillationProvider` 时接管 LLM 蒸馏与 `memory_consolidate`。
 - **自查**：`memory_api_status` 工具返回加载状态、端点清单（含 key 来源与代理决策，全部脱敏），`reload: true` 可手动重读。
 
+### 技能层（推理记忆 → Agent Skill）
+
+蒸馏出的推理记忆可以进一步**发布为 Agent Skill**，遵循 Agent Skills 的工程化 prompt 规范（SKILL.md 前端元数据 + 简洁正文 + 渐进披露资源文件）：
+
+- `memory_publish_skill`：把 1–10 条记忆折叠成一个技能。默认自动生成 kebab-case 名称、模型面向的触发式 description（"Use when…"）、带步骤与**完成标准**的正文，以及三个资源文件——`reasoning-graph.md`（带来源的推理逻辑图）、`structure-signature.md`（抽象工具动作序列）、`evidence.md`（验证证据）。同名再发布会**版本 +1**；技能通过 `sourceMemoryIds` 回指来源记忆，并继承 `unverified` 信任等级。
+- **渐进披露三层**：`memory_list_skills`（第 1 层：仅元数据/触发描述/版本/资源数）→ `memory_load_skill`（第 2 层：完整 SKILL.md 正文与资源清单）→ `memory_load_skill_resource`（第 3 层：单个资源文件内容，按需加载）。
+- **确定性 prompt 工程守卫**：名称 kebab-case 且保留 `memory_` 前缀；description 必须携带触发措辞（when/if/for/当/如果/提到 等）否则拒收；正文与描述禁止 em-dash；资源路径限定扁平 `.md` 文件名（无目录穿越）、单文件 ≤64KB、每技能 ≤5 个；正文/描述有硬上限。
+- **文件导出**：`skillsExportDir`（默认空 = 不导出）配置后，发布即落盘为 `skills/<name>/SKILL.md` + 资源文件 + `skills/README.md` 索引，外部 harness（Claude Code 等）可直接挂载该目录消费。
+- 技能是派生制品，不改变既有记忆/检索行为；删除记忆不影响已发布技能（反之亦然）。
+
 ### 混合检索与可选向量索引
 
 - 本地 BM25 倒排索引索引推理教训、任务情境、前提、工具动作和图标签；中文按单字/二元组匹配，英文及数字按词项匹配。成功和失败分别取 Top-N，默认各 100 条。
@@ -174,6 +184,7 @@ reasoning-memory:
 4. 调用 `memory_save_outcome`，提交 outcome、verifier、evidence；成功时还要提交一句可迁移的 reasoning insight，失败时只在归因明确时提交 failure_mode。也可以提交最多 3 条结构化 `memory_items`（title/description/content/contraindications），或当 profile 开启 `llmDistillationEnabled` 时让插件对捕获轨迹做 LLM 蒸馏（`distill_with_llm: false` 可单次关闭；复用本任务所用模型，除非显式配置 `distillationProvider`/`distillationModel`）。
 5. 调用 `memory_end_task` 清理活动轨迹。若没有 outcome 或失败无法归因，不会写入伪造的记忆条目。
 6. 可选：对同一类任务多次尝试得到的记忆调用 `memory_consolidate`（需 profile 开启 `memoryConsolidationEnabled` 并配置蒸馏模型），用自对比推理把成败经验对比蒸馏成更高质量条目（MaTTS 并行扩展的落点）；源记忆保留，新条目逐条标记 success/fail。
+7. 可选：把反复验证过的记忆用 `memory_publish_skill` 发布为技能（`memory_list_skills` / `memory_load_skill` / `memory_load_skill_resource` 按需消费），供本插件与外部 harness 复用。
 
 `reasoning_memory` 使用 DSH JSON storage domain 的 `per-record` 布局。新增的记忆/审计字段有默认值，兼容已有 v1 记录；旧记忆若没有独立 `reasoning` 字段，Python 会从旧版 `content` 前缀尽力恢复教训用于检索。DSH storage-domain 本身不提供自动数据迁移。MVP 不实现自动逐轮注入、自动重试、LLM-as-judge、在线 bandit 或推理预算控制。完整研究取舍、局限和评测计划见 [MVP_EVALUATION.md](./MVP_EVALUATION.md)。
 

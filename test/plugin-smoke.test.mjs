@@ -9,13 +9,17 @@
 // CD pipeline verifies.
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { resolve } from 'node:path'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const bundleEntry = process.env.PLUGIN_BUNDLE_ENTRY
   ? resolve(process.env.PLUGIN_BUNDLE_ENTRY)
   : fileURLToPath(new URL('../dist/index.js', import.meta.url))
 const { apply } = await import(pathToFileURL(bundleEntry).href)
+
+const exportDir = mkdtempSync(join(tmpdir(), 'rm-smoke-skills-'))
 
 // A complete config object: Cordis normally fills the z defaults; the mock
 // host passes a plain object, so every field must be present here.
@@ -60,6 +64,7 @@ const config = {
   builtinStoreEnabled: process.env.PLUGIN_SMOKE_NO_BUILTIN !== '1',
   builtinStoreDataDir: '',
   apiConfigPath: '',
+  skillsExportDir: exportDir,
 }
 
 function makeMockHost() {
@@ -145,6 +150,10 @@ test('the built bundle boots in a mock DSH host and runs the full memory lifecyc
       'memory_query',
       'memory_api_status',
       'memory_end_task',
+      'memory_publish_skill',
+      'memory_list_skills',
+      'memory_load_skill',
+      'memory_load_skill_resource',
     ]
     for (const name of expectedTools) assert.ok(tools.has(name), `tool ${name} should be registered`)
 
@@ -233,6 +242,52 @@ test('the built bundle boots in a mock DSH host and runs the full memory lifecyc
     }, execFor(sessionId))
     assert.equal(feedback.updated, 1)
 
+    // Skill layer: promote the distilled memory into an Agent Skill, then
+    // walk the three progressive-disclosure layers.
+    const invalidPublish = await tools.get('memory_publish_skill').execute({ memory_ids: [] }, execFor(sessionId))
+    assert.equal(invalidPublish.published, false)
+
+    const published = await tools.get('memory_publish_skill').execute({ memory_ids: [savedMemoryId] }, execFor(sessionId))
+    assert.equal(published.published, true)
+    assert.equal(published.version, 1)
+    assert.equal(published.resourceCount, 3)
+    const skillName = published.name
+    assert.ok(/^[a-z0-9]+(-[a-z0-9]+)*$/.test(skillName))
+
+    const listed = await tools.get('memory_list_skills').execute({}, execFor(sessionId))
+    assert.equal(listed.count, 1)
+    assert.equal(listed.skills[0].name, skillName)
+    assert.ok(listed.skills[0].description.includes('Use when'))
+
+    const loaded = await tools.get('memory_load_skill').execute({ name: skillName }, execFor(sessionId))
+    assert.equal(loaded.found, true)
+    assert.ok(loaded.body.includes('## Steps'))
+    assert.ok(loaded.body.includes('Completion criterion'))
+    assert.deepEqual(loaded.resources, ['reasoning-graph.md', 'structure-signature.md', 'evidence.md'])
+    assert.deepEqual(loaded.sourceMemoryIds, [savedMemoryId])
+
+    const resource = await tools.get('memory_load_skill_resource').execute(
+      { name: skillName, resource: 'reasoning-graph.md' }, execFor(sessionId))
+    assert.equal(resource.found, true)
+    assert.ok(resource.content.includes('## Nodes'))
+    const missingResource = await tools.get('memory_load_skill_resource').execute(
+      { name: skillName, resource: 'nope.md' }, execFor(sessionId))
+    assert.equal(missingResource.found, false)
+
+    // Republishing the same name bumps the version and rewrites the export.
+    const republished = await tools.get('memory_publish_skill').execute({ memory_ids: [savedMemoryId] }, execFor(sessionId))
+    assert.equal(republished.published, true)
+    assert.equal(republished.version, 2)
+
+    // Filesystem export laid out the Agent-Skills folder plus a bucket index.
+    const skillDir = join(exportDir, 'skills', skillName)
+    assert.ok(existsSync(join(skillDir, 'SKILL.md')))
+    assert.ok(existsSync(join(skillDir, 'reasoning-graph.md')))
+    assert.ok(existsSync(join(exportDir, 'skills', 'README.md')))
+    const skillFile = readFileSync(join(skillDir, 'SKILL.md'), 'utf8')
+    assert.ok(skillFile.startsWith('---\nname: '))
+    assert.ok(skillFile.includes('## Steps'))
+
     // API config is disabled in this profile; consolidation is off.
     const apiStatus = await tools.get('memory_api_status').execute({}, execFor(sessionId))
     assert.equal(apiStatus.enabled, false)
@@ -243,5 +298,6 @@ test('the built bundle boots in a mock DSH host and runs the full memory lifecyc
     await tools.get('memory_end_task').execute({ task_id: begin2.taskId }, execFor(sessionId))
   } finally {
     for (const disposer of disposers.splice(0)) await disposer()
+    rmSync(exportDir, { recursive: true, force: true })
   }
 })
