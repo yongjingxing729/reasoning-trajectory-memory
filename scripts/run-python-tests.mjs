@@ -16,5 +16,21 @@ if (!interpreter) {
   console.error(`no Python interpreter found (tried: ${candidates.join(', ')}); Python 3.10+ is required`)
   process.exit(1)
 }
+// Version gate via an exit-code probe (no stdout capture, so it also works in
+// sandboxes that deny pipe-based child stdio): the probe exits 0 for a
+// supported interpreter and 3 for an older one.
+const versionProbe = spawnSync(
+  interpreter,
+  ['-c', 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 3)'],
+  { stdio: 'ignore' },
+)
+if (versionProbe.status === 3) {
+  console.error(`Python 3.10+ is required; the interpreter '${interpreter}' reports an older version.`)
+  process.exit(1)
+}
+if (versionProbe.status !== 0) {
+  console.error(`cannot verify the Python version of '${interpreter}' (probe exited ${versionProbe.status}); Python 3.10+ is required.`)
+  process.exit(1)
+}
 const run = spawnSync(interpreter, ['-m', 'unittest', 'discover', '-s', 'test', '-v'], { stdio: 'inherit' })
 process.exit(run.status ?? 1)
