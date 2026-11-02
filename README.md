@@ -85,6 +85,18 @@ endpoints:                # 命名端点；插件按名字引用，按 kind 校�
 - **文件导出**：`skillsExportDir`（默认空 = 不导出）配置后，发布即落盘为 `skills/<name>/SKILL.md` + 资源文件 + `skills/README.md` 索引，外部 harness（Claude Code 等）可直接挂载该目录消费。
 - 技能是派生制品，不改变既有记忆/检索行为；删除记忆不影响已发布技能（反之亦然）。
 
+### 策略模板库与激活动作化（v0.4.0）
+
+本迭代依据《面向 LLM 智能体的推理模块高效复用研究综述》（30 篇文献）落地其四层映射骨架（任务模式 τ → 策略模板 π → 能力模块 m → 激活动作 a）的**路径 A（上下文级）**，把"何时检索、检索什么、用什么技能"从固定策略升级为显式的、按推理步骤对齐的联合决策：
+
+- **任务模式分类**：`memory_plan_task` 用确定性分类器（task_family 查表 / 双语关键词 / 结构签名统计 / 图节点分布四信号，权重 0.35/0.30/0.20/0.15）把任务分到 7 类模式（multi_hop_qa / code_synthesis / tool_orchestration / gui_operation / long_horizon_planning / numeric_search / general），输出置信度与可审计的证据分解；无把握时明确回落 `general` 而不强行套模板（Tree-of-Experience 的保守录用教训）。
+- **策略模板库**：`StrategyTemplate` 记录（步骤级模块需求 + 结构签名 + 适用模式 + 前提 + 效用统计 + 来源）。5 个内置种子（ToT/ToE 分解—回溯、Self-Refine 生成—验证—修正、ReAct 行动—观察—反思、Voyager 检索—组合—复用、ToolLLM DFSDT 试错—回溯—蒸馏）幂等播种；`memory_publish_template` 支持调用者发布（kebab 名 + `memory_tpl_` 前缀 + 触发式描述守卫，同名版本 +1）；模板还可由 `mine_templates` operation 从记忆的 (结构签名, 任务模式) 确定性挖掘（SequenceMatcher 代表点聚类 θ_join=0.75/θ_form=0.55 + 多序列 LCS 骨干 + min_support 与成功占比 ≥0.5 门控），挖掘入口先供离线评测使用，不注册为模型工具。
+- **激活动作化**：`memory_plan_task` 返回激活计划——匹配模板（match = (0.50 结构 + 0.30 词法 + 0.20 模式一致) × EvolveR 式效用乘子，0.55/0.75 双阈值）、每步模块需求（retrieve_memory / retrieve_template / use_skill / invoke_tool / verify / rollback_check）、**主动检索点**（ProactAgent 式 proactive retrieval 的确定性近似）与推荐技能（≤3，只读匹配）。`memory_retrieve` 新增 `active_template_id` / `step_index` / `retrieval_intent` 把检索对齐到推理步骤，并启用 template 融合通道（RRF 主臂权重 0.15，备选臂 0.20 供消融）。
+- **联合决策与过程级反馈**：`memory_feedback` 新增 `template_id` / `step_index`（模板须属本任务计划，每任务一次），模板效用按 Beta 平滑更新并参与匹配质量乘子；记忆侧 harmful 反馈跨 distinct 任务计数（`harmfulTaskIds` 最近 8 个窗口）达到 `deprecatedAfterHarmfulFeedback` 阈值时标记 `status='deprecated'`（只标记不删除，结果带标记）。
+- **质量门控**：`memory_save_outcome` 可选 `insight_confidence`（0–1），`minInsightConfidence > 0` 时低于阈值的条目拒写并审计（MoT 置信度过滤的写入策略近似；这是策略不是校准的质量判定）。
+- **离线评测**：`scripts/eval`（不进发货包）提供 episode 标注 JSONL 校验、种子化合成数据生成、检索质量（Recall@k/nDCG@k 按 outcome、配额遵守率、自检索率、misleading 误召回）、模板评测（分类 accuracy、匹配 top-k、挖掘纯度/覆盖率）与通道消融矩阵，`python scripts/eval/run_eval.py` 产出 Markdown 报告；样例报告明确标注合成 ≠ 真实标注。
+- **边界声明**：综述的路径 B（LoRA 组合）/ C（SAE 特征干预）/ E（RL 联合决策学习）不在本插件落地——DSH 插件无权重与潜空间访问权限，且拒绝方向干预的双刃剑风险 [24] 要求激活保持在上下文/工具/技能注入这一可审计、可回滚的层面。本迭代的"激活"是可执行的计划动作，不改变模型内部计算；过程级反馈是低代价在线信号，不是校准的强化学习奖励。设计细节与 30 篇文献映射见设计文档 §18。
+
 ### 混合检索与可选向量索引
 
 - 本地 BM25 倒排索引索引推理教训、任务情境、前提、工具动作和图标签；中文按单字/二元组匹配，英文及数字按词项匹配。成功和失败分别取 Top-N，默认各 100 条。
@@ -142,6 +154,8 @@ DSH 通过 `dsh.bundle.patch` 自动将 `reasoning-memory` 插件行加入 profi
 
 推理捕获与蒸馏的可选配置：`captureReasoningEnabled`（默认关闭；开启后 `assistant/message` 的 reasoning 内容块与 token usage 仅暂存在内存，`memory_end_task` 汇总返回，不持久化）、`maxReasoningTextChars`（默认 4000）、`llmDistillationEnabled`、`llmDistillationTemperature`（默认 1.0）、`distillationProvider`/`distillationModel`（留空时复用本任务捕获的模型，或使用 API 配置文件的 `distillation` 端点）、`maxMemoryItemsPerOutcome`（1–3，默认 3）、`deSpecificationThreshold`（默认 0.9）、`relevanceThreshold`（默认 0）、`memoryConsolidationEnabled`、`apiConfigPath`（用户 API 端点配置文件路径，见上文）。蒸馏与整合优先走 API 配置文件的端点，其次通过 `ctx.get('llm')` 使用 DSH llm 服务；全部不可用时自动回退到调用者提交的 insight 路径。
 
+策略模板层的可选配置：`minInsightConfidence`（默认 0；>0 时低于阈值的洞察条目拒写）、`deprecatedAfterHarmfulFeedback`（默认 0；>0 时同一记忆在 ≥N 个不同任务收到 harmful 反馈后标记 deprecated，只标记不删除）、`templateMatchMin`（默认 0.55；`memory_plan_task` 注入模板的最低匹配分）。
+
 向量检索的可选配置示例（其余 DSH profile 字段依开发文档提供）：
 
 ```yaml
@@ -179,16 +193,20 @@ reasoning-memory:
 ## 模型侧生命周期
 
 1. `memory_begin_task` 开始任务并返回 `task_id`。每个 DSH session 同一时间只接受一个活跃任务。
-2. 需要时调用 `memory_retrieve`。结果含策略内容、前提、成功/失败标签、分路分数、信任等级和事件来源；把它当作参考证据，并在当前环境重新验证。也可以用 `memory_query` 按 outcome/类型/信任等级/任务范围做结构化查询（审计、去重、缩小候选）。
-3. 可选调用 `memory_feedback`，只提交当前任务检索到且调用者确认实际用过的记忆；给出短证据，但插件不会保存证据文本或独立核实评价。
-4. 调用 `memory_save_outcome`，提交 outcome、verifier、evidence；成功时还要提交一句可迁移的 reasoning insight，失败时只在归因明确时提交 failure_mode。也可以提交最多 3 条结构化 `memory_items`（title/description/content/contraindications），或当 profile 开启 `llmDistillationEnabled` 时让插件对捕获轨迹做 LLM 蒸馏（`distill_with_llm: false` 可单次关闭；复用本任务所用模型，除非显式配置 `distillationProvider`/`distillationModel`）。
-5. 调用 `memory_end_task` 清理活动轨迹。若没有 outcome 或失败无法归因，不会写入伪造的记忆条目。
-6. 可选：对同一类任务多次尝试得到的记忆调用 `memory_consolidate`（需 profile 开启 `memoryConsolidationEnabled` 并配置蒸馏模型），用自对比推理把成败经验对比蒸馏成更高质量条目（MaTTS 并行扩展的落点）；源记忆保留，新条目逐条标记 success/fail。
-7. 可选：把反复验证过的记忆用 `memory_publish_skill` 发布为技能（`memory_list_skills` / `memory_load_skill` / `memory_load_skill_resource` 按需消费），供本插件与外部 harness 复用。
+2. 可选调用 `memory_plan_task`（`task_desc` 必填，`goal`/`task_family` 可选）获得任务模式分类、匹配的策略模板（步骤/模块需求/主动检索点/效用）、推荐技能与执行提示；没有模板通过阈值时结果明确建议按 general 模式直接执行。计划中的模板 `template_id` 可随后传给 `memory_retrieve` 做步骤对齐检索。
+3. 需要时调用 `memory_retrieve`。结果含策略内容、前提、成功/失败标签、分路分数、信任等级和事件来源；把它当作参考证据，并在当前环境重新验证。也可以用 `memory_query` 按 outcome/类型/信任等级/任务范围做结构化查询（审计、去重、缩小候选）。
+4. 可选调用 `memory_feedback`，只提交当前任务检索到且调用者确认实际用过的记忆；给出短证据，但插件不会保存证据文本或独立核实评价。也可以对计划中的模板（`template_id`）给 helpful/harmful/neutral 评价。
+5. 调用 `memory_save_outcome`，提交 outcome、verifier、evidence；成功时还要提交一句可迁移的 reasoning insight，失败时只在归因明确时提交 failure_mode。也可以提交最多 3 条结构化 `memory_items`（title/description/content/contraindications，可选逐条 `insight_confidence`），或当 profile 开启 `llmDistillationEnabled` 时让插件对捕获轨迹做 LLM 蒸馏（`distill_with_llm: false` 可单次关闭；复用本任务所用模型，除非显式配置 `distillationProvider`/`distillationModel`）。
+6. 调用 `memory_end_task` 清理活动轨迹。若没有 outcome 或失败无法归因，不会写入伪造的记忆条目。
+7. 可选：对同一类任务多次尝试得到的记忆调用 `memory_consolidate`（需 profile 开启 `memoryConsolidationEnabled` 并配置蒸馏模型），用自对比推理把成败经验对比蒸馏成更高质量条目（MaTTS 并行扩展的落点）；源记忆保留，新条目逐条标记 success/fail。
+8. 可选：把反复验证过的记忆用 `memory_publish_skill` 发布为技能（`memory_list_skills` / `memory_load_skill` / `memory_load_skill_resource` 按需消费），供本插件与外部 harness 复用。
+9. 可选：用 `memory_publish_template` 把提炼出的任务处理套路发布为策略模板（`memory_list_templates` / `memory_load_template` 按需消费），供 `memory_plan_task` 在后续任务中匹配。
 
 `reasoning_memory` 使用 DSH JSON storage domain 的 `per-record` 布局。新增的记忆/审计字段有默认值，兼容已有 v1 记录；旧记忆若没有独立 `reasoning` 字段，Python 会从旧版 `content` 前缀尽力恢复教训用于检索。DSH storage-domain 本身不提供自动数据迁移。MVP 不实现自动逐轮注入、自动重试、LLM-as-judge、在线 bandit 或推理预算控制。完整研究取舍、局限和评测计划见 [MVP_EVALUATION.md](./MVP_EVALUATION.md)。
 
 ## 研究依据
+
+本迭代（v0.4.0）的策略模板库与激活动作化依据《面向 LLM 智能体的推理模块高效复用研究综述（终稿）》及其 30 篇已核实文献（四层映射骨架与路径 A；完整映射表与越界声明见设计文档 §18），其中关键数字已经独立复核（`docs/research-notes/03-survey-facts.md`）：Tree-of-Experience（arXiv:2608.09044）Game of 24 相对无经验 ToT 基线 +31.4%、FinEvolveBench tsIC 平均 +41.24%（12 个评测设置）；ProactAgent（arXiv:2604.20572）SciWorld/AlfWorld/StuLife 成功率相对提升 up to 32%、交互轮次减少 over 33%；MemWeaver（arXiv:2601.18204）LoCoMo 输入上下文长度相对长上下文基线压缩 over 95%；EvolveR（arXiv:2510.16079）"离线自蒸馏 → 在线交互 → 策略进化"三组件（正文 §3）与 (c_succ+1)/(c_use+2) 效用分；LoRAHub（arXiv:2307.13269）组合不引入新参数、不需梯度（CMA-ES）。
 
 - Ouyang et al., [ReasoningBank: Scaling Agent Self-Evolving with Reasoning Memory](https://arxiv.org/abs/2509.25140), ICLR 2026。
 - 官方实现：[google-research/reasoning-bank](https://github.com/google-research/reasoning-bank)。该仓库提供 SWE-Bench 与 WebArena 实验代码；本插件复用其成功/失败经验蒸馏、检索、回写的核心框架思想，不复制其 benchmark harness。

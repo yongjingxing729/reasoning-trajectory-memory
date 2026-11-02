@@ -606,6 +606,72 @@ reasoning-trajectory-memory/（本仓库根目录即 DSH 插件包）
 
 ---
 
+## 18. 四层映射骨架落地（2026-11-02 迭代，v0.4.0）
+
+### 18.1 迭代动机与学术来源
+
+本迭代依据《面向 LLM 智能体的推理模块高效复用研究综述（终稿）》（30 篇文献，见 §18.3 映射表）落地其核心命题：把"任务处理思路逻辑"与"功能/领域激活"之间的映射作为一等公民。综述归纳的五条结构性空白中，本插件可以补上三条的插件侧对应物：
+
+| 综述空白 | 本迭代落点 |
+|---|---|
+| 空白 1：检索结果落点单一（只能进 prompt，复用是建议性的） | `memory_plan_task` 产出**可执行的激活计划**：步骤级模块需求 + 主动检索点 + 推荐技能，把"建议"变成"计划动作"（仍为上下文级，插件无权重访问） |
+| 空白 3：粒度失配（经验检索在任务级、激活干预在 token 级，缺"推理步骤"粒度） | 新增策略模板层 + `strategyTemplateId`/`reasoningLevel` 记忆字段 + `memory_retrieve` 的 `active_template_id`/`step_index`/`retrieval_intent` 步骤对齐参数 |
+| 空白 4：检索与激活无联合决策 | `memory_plan_task` 是检索+激活的联合决策面；`memory_feedback` 扩展过程级信号（模板/步骤维度）驱动效用统计 |
+
+空白 2（激活工程无持久化）在插件边界内对应为：激活**方案**（模板+模块需求）获得持久化与生命周期（挖掘→匹配→反馈→效用更新），但权重级激活本身不落地（见 §18.4）。空白 5（联合评测缺失）由 `scripts/eval` 离线 harness 起步（检索质量 × 模板匹配 × 消融，规范见 `docs/research-notes/04-eval-schema.md`）。
+
+### 18.2 四层映射在插件中的落地
+
+| 层 | 综述定义 | 插件构造 |
+|---|---|---|
+| L1 任务模式 τ | 任务表示学习/结构特征/关键词信号 | `classify_task_pattern()`：7 类确定性分类器（multi_hop_qa / code_synthesis / tool_orchestration / gui_operation / long_horizon_planning / numeric_search / general），四信号加权（task_family 查表 0.35 / 词法 0.30 / 结构签名 0.20 / 图节点分布 0.15），argmax + 边际置信度，general 兜底 |
+| L2 策略模板 π | 策略模板/轨迹骨架（CoALA procedural memory 的结构化扩展） | `StrategyTemplate` 域记录：5 个内置种子（ToT/ToE 分解-回溯、Self-Refine、ReAct、Voyager 检索-复用、ToolLLM DFSDT）+ 确定性挖掘（SequenceMatcher 代表点聚类 θ_join=0.75/θ_form=0.55 + 多序列 LCS 骨干 + 成功占比门控）+ 调用者发布；`match(q,T) = (0.50 结构 + 0.30 词法 + 0.20 模式一致) × quality`，EvolveR 式 quality = (0.5+0.5×(succ+1)/(use+2))×(1−0.3×harmRatio) |
+| L3 能力模块 m | 可寻址功能单元 + 元数据（适用域/触发条件/干预强度/历史效用） | 插件可寻址模块 = 推理记忆（success/failure）、策略模板、Agent Skill、DSH 工具、验证器；元数据 = 适用模式/前提/效用统计（Beta 平滑计数）；`moduleKind` 字段为未来宿主级模块（LoRA/SAE）预留接口占位 |
+| L4 激活动作 a | 残差流叠加/特征干预/路由/工具注入/上下文注入 | 插件可执行的激活动作 = 上下文注入（检索记忆/模板）、技能加载（use_skill）、工具调用注入（invoke_tool）、验证（verify）、失败教训检索（rollback_check）；由激活计划的步骤级模块需求 d_t 显式驱动 |
+
+**联合决策形式化**（综述 §2.1 的插件侧实例）：`memory_plan_task` 对任务 τ 与记忆状态 M_t 执行 π* = argmax match(τ, π)，展开为步骤级需求 d_t（模板步骤声明），并输出主动检索点（ProactAgent 式 proactive retrieval 的确定性近似）；`memory_retrieve` 以 `(active_template_id, step_index, retrieval_intent)` 把"何时检索、检索什么"对齐到推理步骤。过程级反馈（模板/记忆的 helpful/harmful/neutral）闭环回写效用统计——**这是低代价在线信号，不是校准的强化学习奖励**（ProactRL 的配对 continuation 过程奖励需训练基础设施，本插件不实现，见 §18.4）。
+
+### 18.3 与综述 30 篇文献的映射
+
+| 文献 | 采用/借鉴 | 不采用及理由 |
+|---|---|---|
+| Reflexion [1] | 失败→可检索修正知识；反馈信号闭环（本插件 `memory_feedback`） | 扁平反思池（ToE 证实有低于无经验基线风险）；反思文本持久化 |
+| ExpeL [2] | 跨任务经验池 + 洞察/轨迹双粒度检索（reasoning/semanticText 双字段） | 无质量过滤的 insight 提炼（本插件用置信度门控 + 去特异化守卫） |
+| ReAct [3] | 轨迹携带能力需求信号——`structureSignature` 与模板挖掘的数据来源 | thought 文本采集（隐私边界） |
+| ECL [4] | 短期轨迹/长期任务级双层经验（工作记忆 vs 程序性知识划分） | 纯上下文注入无自演化（本插件加效用统计） |
+| EvolveR [5] | 生命周期闭环（离线提炼→在线检索→效用维护）；(c_succ+1)/(c_use+2) 质量分原样复刻；原则库去重 | RL 策略进化（GRPO，无训练基础设施）；检索决策的策略化学习 |
+| Tree-of-Experience [6] | 经验结构必须与推理层级对齐的方法论教训；可靠性由环境结果校准；保守录用（低质量经验管理不如无经验） | 分析视角×推理路径的完整树；手工层级设计（本插件以模板 coreSignature 为受限路径结构） |
+| ProactAgent [7] | 检索的动作化思想（激活计划 + 主动检索点）；过程级信号；"总是检索是次优的" | ProactRL 配对 continuation 训练（无 RL 基础设施） |
+| Self-Refine [8] | 生成—验证—修正作为内置模板（self-refine） | 跨任务复用机制（模板库承担） |
+| AgentTrek [9] | 轨迹规模化合成思想 → eval 合成数据生成器 | 教程引导回放管线（超出插件边界） |
+| ChatDev [10] / Voyager [11] | 多智能体实验床概念；技能库可执行化与跨任务迁移（skills 层既有） | 自动课程；Minecraft 环境 |
+| MoT [12] | 置信度过滤作为质量门控（`insightConfidence` 写入门控） | 测试前预思考管线 |
+| Distilling step-by-step [13] / STaR [14] | 推理过程比答案承载更多可迁移信息——"复用推理而非答案"的立论基础；自举闭环思想 → 模板挖掘 | 参数蒸馏（插件无权重访问） |
+| LoRAHub [15] | 能力模块组合化思想：模板 = 模块序列的确定性组合，不训练任何参数 | CMA-ES 系数搜索（模块组合不需数值优化） |
+| Generative Agents [16] | 反思即压缩（轨迹→模板提炼同构） | 手工加权检索评分 |
+| MemGPT [17] | 记忆控制流下放给智能体（显式工具即此理念） | OS 分页语义 |
+| HippoRAG [18] | 图结构单步多跳供给（reasoningGraph 既有） | KG 构建依赖 |
+| A-MEM [19] | 记忆自我重组（模板效用/弃用标记的演化） | 动态链接改写 |
+| MemWeaver [20] | 抽象模式 + 原始证据双通道检索（模板通道 + 记忆通道并存）；>95% 上下文压缩的结构化复用实证 | 三组件图/段落记忆实现 |
+| CoALA [21] | 坐标系统：策略模板 = procedural memory 扩展；激活动作 = CoALA 未显式建模的 internal action 的插件侧近似；闭环学习 = learning processes | 完整认知架构复刻 |
+| ActAdd [22] / CAA [23] | 方向提取的对比方法论（仅思想借鉴：模板挖掘用对比式签名聚类） | 权重干预（无权限） |
+| Refusal direction [24] | **警示引用**：激活开关是双刃剑，同一机制可用于越狱——本插件坚持激活=上下文/工具级、可审计、可回滚 | 残差流干预 |
+| Gemma Scope [25] / CoT 特征干预 [26] | 功能可被潜空间开关触发的证据（论证深度压榨的动机） | SAE 特征干预（无权限；跨模型可移植性未解） |
+| DeepSeekMoE [27] | 通用↔专域分工思想 → 模板内通用步骤/专域步骤的模块需求区分 | 路由操纵 |
+| RouterBench [28] / Gorilla [29] / ToolLLM [30] | 路由决策需领域信号 + 试错反馈（本插件模板元数据 + 效用统计的论据）；DFSDT 内置模板 | 多 LLM 路由；大规模 API 语料 |
+
+### 18.4 越界声明（写实的边界）
+
+- **路径 B（LoRA 组合）/ C（SAE 特征干预）/ E（RL 联合决策）不落地**：DSH 插件无模型权重与潜空间访问权限；[24] 的拒绝方向双刃剑警示（同一机制可用于越狱）与 [25][26] 的跨模型对齐难题使插件侧干预不具备安全与工程前提。`moduleKind` 字段仅作未来宿主级扩展的接口占位。
+- **本迭代的"激活"是上下文/工具/技能注入的可执行化，不改变模型内部计算**：与综述 §2.4"深度=提升每一步执行的有效能力密度"的技术含义不同构；本插件主张的增益是"在正确步骤、以正确形式、给出正确经验/工具建议"，效应必须由评测验证（合成评测样本 ≠ 真实标注集结论）。
+- **过程级反馈是低代价在线信号，不是 RL 奖励**：Beta 平滑计数影响排序的幅度受上限约束（与现有 feedback 乘数 0.8–1.2 同风格），不宣称校准的信用分配。
+
+### 18.5 与既有设计原则的一致性
+
+本迭代延续 MVP 的三条内建防御（结果/过程分离、失败归因允许未知、来源与信任边界）与确定性/可审计原则：分类器与匹配分全部可拆解（evidence/scores 输出）；挖掘全程无随机、幂等；fail 为主的簇不发射模板（保守录用，ToE 教训 [6]）；模板弃用只标记不删除（EvolveR 式剪枝的保守版）。所有阈值/权重为待标注集校准的初值，`scripts/eval` 的消融矩阵即校准工具。
+
+---
+
 ## 附录：评审记录
 
 - 2026-10-25 第 1 组（架构 + 数据模型 + 生命周期）确认，含补充"存储的推理模块对进行中任务的作用"（四作用点）；
@@ -618,3 +684,4 @@ reasoning-trajectory-memory/（本仓库根目录即 DSH 插件包）
 - 2026-10-28 研究迭代：将成功策略/失败教训单独保存为 `reasoning`，让推理教训成为检索主要语义信号；`auto` 分别使用情境、推理、动作结构权重 0.20/0.50/0.30，无结构时 0.30/0.70/0。加入当前任务排除，避免自检索；新增每任务每记忆仅一次的 helpful/harmful/neutral 聚合反馈，效用影响封顶在 ±20%，不改变正反配额或信任等级。增量字段用 schema 默认值兼容已有 v1 项目，不改变 DSH 插件及存储域版本。评估材料见 `MVP_EVALUATION.md`；分数权重仍需离线消融，不宣称已达到论文结果。
 - 2026-10-28 混合检索：按 Hindsight 的多通道检索/RRF、H-Mem 的树图协同检索方向和 Qdrant 的过滤索引能力，新增 TypeScript BM25 与可选 Qdrant HNSW 候选，Python 做推理/结构/图信号 RRF；DSH domain 保持事实源、向量层为可重建派生索引。已验证 TypeScript build、Python 20/20 和 Node mock 测试 3/3（含后续 enterprise rule RAG）；真实 Qdrant、embedding endpoint、DSH profile 与基准尚未验证。
 - 2026-10-28 企业规则 RAG：增加独立只读企业规则 collection、固定 ruleSet scope 和有效期过滤、按需/required 配置、来源/版本返回及 retrieval audit 状态；规则正文不写入经验记忆或审计记录。参考 Qdrant read-only keys 与 payload filtering 和 OWASP RAG 间接注入风险建议；尚未运行真实企业 KB 与 DSH profile 验证。
+- 2026-11-02 四层映射落地（v0.4.0）：依据《推理模块高效复用》综述（30 篇文献）新增策略模板库、7 类任务模式分类、激活计划（`memory_plan_task`）、模板挖掘/发布、检索 template 通道与步骤对齐参数、洞察置信度写入门控、保守弃用标记与 `scripts/eval` 离线评测 harness。路径 A（上下文级）落地，路径 B/C/E（LoRA/SAE/RL 权重级）为文档化越界项（见 §18.4）。DSH 契约经双人核实：v1 domain 新增 templates 表不破坏旧介质（无表结构哈希、缺失表回填空 Map、逐记录读取边界校验），templates 表 schema 铁律为 additive。模板通道 RRF 权重（template 0.15 主臂 / structure 0.05+template 0.20 备选臂）与分类器/挖掘阈值均为待标注集校准的初值。
