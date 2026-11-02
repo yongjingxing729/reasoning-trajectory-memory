@@ -28,6 +28,15 @@ from reasoning_memory_core.reasoning_graph import (
     graph_similarity,
 )
 from reasoning_memory_core.retrieval import _retrieve
+from reasoning_memory_core.templates import (
+    apply_template_feedback,
+    builtin_template_records,
+    classify_task_pattern,
+    mine_templates,
+    plan_task,
+    publish_template_validate,
+    template_match_score,
+)
 from reasoning_memory_core.text_similarity import (
     _clean_text,
     _reasoning_text,

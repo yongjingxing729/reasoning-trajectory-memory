@@ -61,14 +61,22 @@ def _normalize_items(
     semantic_text: str,
     threshold: float,
     max_items: int,
-) -> tuple[list[dict[str, Any]], str]:
-    """Normalize, gate, de-specify, and deduplicate structured memory items."""
+    min_confidence: float,
+    request_confidence: float,
+) -> tuple[list[dict[str, Any]], str, int]:
+    """Normalize, gate, de-specify, and deduplicate structured memory items.
+
+    The insight-confidence gate (final spec 3.5) rejects items whose declared
+    insightConfidence falls below the configured minimum; items without a
+    declared value inherit the request-level value (0 = not provided).
+    """
     raw_items = request.get("items")
     if not isinstance(raw_items, list) or not raw_items:
-        return [], "no memory items were provided"
+        return [], "no memory items were provided", 0
     accepted: list[dict[str, Any]] = []
     seen_contents: list[str] = []
     first_rejection = ""
+    gate_rejected = 0
     for raw in raw_items[: max_items * 2]:
         if not isinstance(raw, dict):
             if not first_rejection:
@@ -93,6 +101,18 @@ def _normalize_items(
                 cleaned = _clean_text(entry, MAX_CONTRAINDICATION_CHARS)
                 if cleaned:
                     contraindications.append(cleaned)
+        raw_confidence = raw.get("insightConfidence")
+        if isinstance(raw_confidence, (int, float)):
+            item_confidence = max(0.0, min(1.0, float(raw_confidence)))
+        else:
+            item_confidence = request_confidence
+        # The gate is a write policy, not a calibrated quality verdict (the
+        # MoT confidence-filtering idea in engineering approximation).
+        if min_confidence > 0.0 and item_confidence < min_confidence:
+            gate_rejected += 1
+            if not first_rejection:
+                first_rejection = "an item fell below the insight confidence gate"
+            continue
         # De-specification guard: a lesson that nearly restates the task
         # description cannot transfer to structurally similar, surface-different
         # tasks and is rejected as too task-specific.
@@ -113,13 +133,15 @@ def _normalize_items(
             "content": content,
             "contraindications": contraindications,
             "outcome": outcome,
+            "insightConfidence": item_confidence,
         })
     if not accepted:
+        gate_note = f" ({gate_rejected} fell below the insight confidence gate)" if gate_rejected else ""
         return [], (
-            f"{first_rejection}; items must carry a success/fail outcome, non-empty content, "
+            f"{first_rejection}{gate_note}; items must carry a success/fail outcome, non-empty content, "
             "must not restate the task description, and must not duplicate each other"
-        )
-    return accepted[:max_items], ""
+        ), gate_rejected
+    return accepted[:max_items], "", gate_rejected
 
 
 def _make_memory(request: dict[str, Any]) -> dict[str, Any]:
@@ -154,6 +176,22 @@ def _make_memory(request: dict[str, Any]) -> dict[str, Any]:
     if isinstance(raw_max_items, (int, float)):
         max_items = max(1, min(MAX_ITEMS_PER_OUTCOME, int(raw_max_items)))
 
+    # v0.4.0 additive fields (final spec 2.2, 3.5): the insight-confidence
+    # gate is a write policy, not a calibrated quality verdict.
+    min_confidence = 0.0
+    raw_min_confidence = request.get("minInsightConfidence")
+    if isinstance(raw_min_confidence, (int, float)):
+        min_confidence = max(0.0, min(1.0, float(raw_min_confidence)))
+    request_confidence = 0.0
+    raw_request_confidence = request.get("insightConfidence")
+    if isinstance(raw_request_confidence, (int, float)):
+        request_confidence = max(0.0, min(1.0, float(raw_request_confidence)))
+    strategy_template_id = _clean_text(request.get("strategyTemplateId"), 100)
+    reasoning_level = request.get("reasoningLevel")
+    if reasoning_level not in ("analysis", "path", "step"):
+        reasoning_level = "path"
+    gate_rejected = 0
+
     empty = {"stored": False, "reason": "", "memories": []}
     if outcome not in ("success", "fail"):
         empty["reason"] = "partial/unknown outcomes are not admitted as positive or negative reasoning memories"
@@ -181,9 +219,12 @@ def _make_memory(request: dict[str, Any]) -> dict[str, Any]:
         elif not signature:
             empty["reason"] = "no classifiable tool-action sequence was observed"
             return empty
-        items, item_error = _normalize_items(request, semantic_text, threshold, max_items)
+        items, item_error, gate_rejected = _normalize_items(
+            request, semantic_text, threshold, max_items, min_confidence, request_confidence,
+        )
         if item_error:
             empty["reason"] = item_error
+            empty["gateRejectedCount"] = gate_rejected
             return empty
     else:
         # Legacy single-insight path keeps its original gates verbatim.
@@ -198,6 +239,9 @@ def _make_memory(request: dict[str, Any]) -> dict[str, Any]:
         if outcome == "fail" and not failure_mode:
             empty["reason"] = "failure attribution is missing; no negative lesson was created"
             return empty
+        if min_confidence > 0.0 and request_confidence < min_confidence:
+            empty["reason"] = "the insight confidence is below the configured gate; no memory was created"
+            return empty
         lesson = reasoning_insight if outcome == "success" else failure_mode
         items = [{
             "title": lesson[:MAX_TITLE_CHARS] or "untitled",
@@ -205,6 +249,7 @@ def _make_memory(request: dict[str, Any]) -> dict[str, Any]:
             "content": lesson,
             "contraindications": [],
             "outcome": outcome,
+            "insightConfidence": request_confidence,
         }]
 
     now = time.time_ns() // 1_000_000
@@ -260,6 +305,10 @@ def _make_memory(request: dict[str, Any]) -> dict[str, Any]:
             "updatedAt": now,
             "semanticText": semantic_text,
             "structureSignature": signature if method != "llm_self_contrast" else [],
+            "strategyTemplateId": strategy_template_id,
+            "reasoningLevel": reasoning_level,
+            "insightConfidence": entry.get("insightConfidence", request_confidence),
+            "status": "active",
         }
         memories.append(item)
 
@@ -268,4 +317,5 @@ def _make_memory(request: dict[str, Any]) -> dict[str, Any]:
         "stored": True,
         "reason": f"stored {len(memories)} unverified reasoning {label}",
         "memories": memories,
+        "gateRejectedCount": gate_rejected,
     }
