@@ -68,6 +68,10 @@ export interface StructuredMemoryRow {
   extractionMethod: string
   distillationModel: string
   sourceMemoryIds: string[]
+  strategyTemplateId: string
+  reasoningLevel: string
+  insightConfidence: number
+  status: string
 }
 
 export interface StructuredQueryFilter {
@@ -75,6 +79,9 @@ export interface StructuredQueryFilter {
   type?: 'strategy' | 'structure' | 'failure'
   trustLevel?: 'verified' | 'unverified' | 'unknown'
   taskScope?: string
+  status?: 'active' | 'deprecated'
+  strategyTemplateId?: string
+  reasoningLevel?: 'analysis' | 'path' | 'step'
   limit: number
   offset: number
   sortBy: 'created_at' | 'updated_at' | 'confidence'
@@ -94,12 +101,18 @@ const SORT_COLUMNS = {
   confidence: 'confidence',
 } as const
 
+// Bump when the memories table shape changes. A persisted store stamped with
+// an older version is dropped and rebuilt from the canonical storageDomain on
+// the next synchronize, mirroring the embedding-dimension rebuild below.
+const SCHEMA_VERSION = '2'
+
 const ROW_SELECT = `
   memory_id, type, outcome, task_scope, preconditions, content, reasoning,
   title, description, contraindications, reasoning_graph, feedback, provenance,
   evidence, confidence, trust_level, extractor_version, created_at, updated_at,
   semantic_text, structure_signature, extraction_method, distillation_model,
-  source_memory_ids`
+  source_memory_ids, strategy_template_id, reasoning_level, insight_confidence,
+  status`
 
 export class BuiltinMemoryStore {
   readonly embedderConfigured: boolean
@@ -164,6 +177,14 @@ export class BuiltinMemoryStore {
         // table instead of migrating in place.
         await db.exec('DROP TABLE IF EXISTS memories')
       }
+      const schemaVersion = await db.query<{ value: string }>(
+        "SELECT value FROM store_meta WHERE key = 'schema_version'",
+      )
+      if (schemaVersion.rows[0]?.value !== SCHEMA_VERSION) {
+        // A derived store: a shape change rebuilds the table instead of
+        // migrating in place.
+        await db.exec('DROP TABLE IF EXISTS memories')
+      }
       const dimension = this.options.embeddingDimension
       await db.exec(`
         CREATE TABLE IF NOT EXISTS memories (
@@ -191,6 +212,10 @@ export class BuiltinMemoryStore {
           extraction_method TEXT NOT NULL,
           distillation_model TEXT NOT NULL,
           source_memory_ids JSONB NOT NULL,
+          strategy_template_id TEXT NOT NULL,
+          reasoning_level TEXT NOT NULL,
+          insight_confidence REAL NOT NULL,
+          status TEXT NOT NULL,
           content_hash TEXT NOT NULL,
           row_hash TEXT NOT NULL,
           embedding vector(${dimension})
@@ -203,6 +228,10 @@ export class BuiltinMemoryStore {
       await db.query(
         "INSERT INTO store_meta (key, value) VALUES ('embedding_dimension', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
         [String(this.options.embeddingDimension)],
+      )
+      await db.query(
+        "INSERT INTO store_meta (key, value) VALUES ('schema_version', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        [SCHEMA_VERSION],
       )
     })()
     return this.schemaReady
@@ -243,6 +272,11 @@ export class BuiltinMemoryStore {
       extractionMethod: item.extractionMethod ?? 'caller_insight',
       distillationModel: item.distillationModel ?? '',
       sourceMemoryIds: item.sourceMemoryIds ?? [],
+      strategyTemplateId: item.strategyTemplateId ?? '',
+      reasoningLevel: item.reasoningLevel ?? 'path',
+      insightConfidence: item.insightConfidence ?? 0,
+      status: item.status ?? 'active',
+      harmfulTaskIds: item.harmfulTaskIds ?? [],
     }
     return createHash('sha256').update(JSON.stringify(row)).digest('hex')
   }
@@ -273,6 +307,10 @@ export class BuiltinMemoryStore {
       item.extractionMethod ?? 'caller_insight',
       item.distillationModel ?? '',
       JSON.stringify(item.sourceMemoryIds ?? []),
+      item.strategyTemplateId ?? '',
+      item.reasoningLevel ?? 'path',
+      item.insightConfidence ?? 0,
+      item.status ?? 'active',
       this.contentHashOf(item),
       this.rowHashOf(item),
     ]
@@ -285,10 +323,11 @@ export class BuiltinMemoryStore {
       provenance, evidence, confidence, trust_level, extractor_version,
       created_at, updated_at, semantic_text, structure_signature,
       extraction_method, distillation_model, source_memory_ids,
+      strategy_template_id, reasoning_level, insight_confidence, status,
       content_hash, row_hash
     ) VALUES (
       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-      $17, $18, $19, $20, $21, $22, $23, $24, $25, $26
+      $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30
     ) ON CONFLICT (memory_id) DO UPDATE SET
       type = EXCLUDED.type,
       outcome = EXCLUDED.outcome,
@@ -313,6 +352,10 @@ export class BuiltinMemoryStore {
       extraction_method = EXCLUDED.extraction_method,
       distillation_model = EXCLUDED.distillation_model,
       source_memory_ids = EXCLUDED.source_memory_ids,
+      strategy_template_id = EXCLUDED.strategy_template_id,
+      reasoning_level = EXCLUDED.reasoning_level,
+      insight_confidence = EXCLUDED.insight_confidence,
+      status = EXCLUDED.status,
       content_hash = EXCLUDED.content_hash,
       row_hash = EXCLUDED.row_hash`
 
@@ -480,6 +523,9 @@ export class BuiltinMemoryStore {
     if (filter.type) push('type = $?', filter.type)
     if (filter.trustLevel) push('trust_level = $?', filter.trustLevel)
     if (filter.taskScope) push("position($? in task_scope) > 0", filter.taskScope)
+    if (filter.status) push('status = $?', filter.status)
+    if (filter.strategyTemplateId) push('strategy_template_id = $?', filter.strategyTemplateId)
+    if (filter.reasoningLevel) push('reasoning_level = $?', filter.reasoningLevel)
     const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
     const sortColumn = SORT_COLUMNS[filter.sortBy] ?? 'created_at'
     const sortOrder = filter.sortOrder === 'asc' ? 'ASC' : 'DESC'
@@ -522,6 +568,10 @@ export class BuiltinMemoryStore {
       extractionMethod: String(row.extraction_method ?? ''),
       distillationModel: String(row.distillation_model ?? ''),
       sourceMemoryIds: this.parseJsonArray(row.source_memory_ids),
+      strategyTemplateId: String(row.strategy_template_id ?? ''),
+      reasoningLevel: String(row.reasoning_level ?? ''),
+      insightConfidence: Number(row.insight_confidence ?? 0),
+      status: String(row.status ?? ''),
     }
   }
 

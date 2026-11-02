@@ -1,5 +1,5 @@
 import type { Context } from '@deepseek-ai/cordis'
-import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+import type { JsonValue, Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-storage-domain'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -11,9 +11,11 @@ import {
   memoryItemSchema,
   reasoningMemoryDomain,
   retrievalRecordSchema,
+  strategyTemplateSchema,
   type MemoryItem,
+  type StrategyTemplate,
 } from './domain.js'
-import { runReasoningCore } from './python.js'
+import { checkPythonVersion, runReasoningCore } from './python.js'
 import { LexicalMemoryIndex } from './lexical-index.js'
 import { QdrantMemoryIndex } from './vector-index.js'
 import {
@@ -95,6 +97,9 @@ export interface Config {
   builtinStoreDataDir?: string
   apiConfigPath?: string
   skillsExportDir?: string
+  minInsightConfidence?: number
+  deprecatedAfterHarmfulFeedback?: number
+  templateMatchMin?: number
 }
 
 const defaultPython = process.platform === 'win32' ? 'python' : 'python3'
@@ -141,6 +146,9 @@ export const Config: z<Config> = z.object({
   builtinStoreDataDir: z.string().default(''),
   apiConfigPath: z.string().default(''),
   skillsExportDir: z.string().default(''),
+  minInsightConfidence: z.number().min(0).max(1).default(0),
+  deprecatedAfterHarmfulFeedback: z.number().min(0).default(0),
+  templateMatchMin: z.number().min(0).max(1).default(0.55),
 })
 
 type Route = 'auto' | 'semantic' | 'structure' | 'graph' | 'hybrid'
@@ -163,6 +171,8 @@ type ActiveTask = {
   pendingToolNames: Map<string, string>
   retrievedMemoryIds: Set<string>
   feedbackMemoryIds: Set<string>
+  planTemplateIds: Set<string>
+  templateFeedbackRecorded: Set<string>
   reasoningText: string
   reasoningCaptureStatus: 'disabled' | 'provided' | 'not-provided'
   capturedModel: { provider: string; model: string } | null
@@ -172,6 +182,7 @@ type DistillResponse = {
   stored: boolean
   reason: string
   memories?: MemoryItem[]
+  gateRejectedCount?: number
 }
 type RetrievalRow = {
   item: { reasoning?: string; reasoningGraph?: MemoryItem['reasoningGraph'] }
@@ -184,6 +195,8 @@ type RetrievalRow = {
   graphScore: number
   lexicalScore: number
   vectorScore: number
+  templateScore: number
+  deprecated: boolean
   combinedScore: number
   utilityMultiplier: number
 }
@@ -199,6 +212,7 @@ type RetrievalResponse = {
     graphScore: number
     lexicalScore: number
     vectorScore: number
+    templateScore: number
     combinedScore: number
     utilityMultiplier: number
     contextRank: number | null
@@ -218,9 +232,56 @@ type RetrievalResponse = {
     fallbackUsed: boolean
     thresholdFilteredCount: number
   }
-  fusionWeights: { context: number; reasoning: number; structure: number; graph: number; vector: number; lexical: number }
+  fusionWeights: { context: number; reasoning: number; structure: number; graph: number; vector: number; lexical: number; template?: number }
   fusionMode: 'weighted' | 'rrf'
+  templateChannelWeight?: number
+  deprecatedFilteredCount?: number
   reason: string
+}
+
+type TaskPattern = 'multi_hop_qa' | 'code_synthesis' | 'tool_orchestration' | 'gui_operation' | 'long_horizon_planning' | 'numeric_search' | 'general'
+
+type PlanResponse = {
+  pattern: TaskPattern
+  confidence: number
+  evidence: Array<{ signal: string; hit: JsonValue; weight: number }>
+  scores: Record<string, number>
+  fallback: boolean
+  matchedTemplates: Array<{
+    templateId: string
+    name: string
+    description: string
+    taskPatterns: string[]
+    steps: StrategyTemplate['steps']
+    structureSignature: string[]
+    preconditions: string[]
+    activeRetrievalPoints: number[]
+    score: number
+    breakdown: { struct: number; lexical: number; pattern: number; quality: number }
+    strongMatch: boolean
+    injectable: boolean
+    deprecated: boolean
+    utility: StrategyTemplate['utility']
+  }>
+  plan: string
+  audit: {
+    matchThreshold: number
+    evaluatedTemplates: number
+    querySignature: string[]
+  }
+}
+
+type PublishValidateResponse = {
+  valid: boolean
+  issues: string[]
+  normalized: {
+    name: string
+    description: string
+    taskPatterns: string[]
+    steps: Array<{ index: number; title: string; moduleDemands: Array<{ kind: string; intent: string }> }>
+    preconditions: string[]
+    structureSignature: string[]
+  }
 }
 
 const REASONING_GRAPH_SCHEMA = {
@@ -290,6 +351,8 @@ const MEMORY_VIEW_SCHEMA = {
     graphScore: { type: 'number', required: true },
     lexicalScore: { type: 'number', required: true },
     vectorScore: { type: 'number', required: true },
+    templateScore: { type: 'number', required: true },
+    deprecated: { type: 'boolean', required: true },
     combinedScore: { type: 'number', required: true },
     utilityMultiplier: { type: 'number', required: true },
     sourceSessionId: { type: 'string', required: true },
@@ -359,6 +422,7 @@ const SAVE_OUTPUT_SCHEMA = {
     reason: { type: 'string', required: true },
     memoryIds: { type: 'array', required: true, items: { type: 'string' } },
     trustLevel: { type: 'string', required: true, enum: ['unverified', 'not-applicable'] },
+    gateRejectedCount: { type: 'integer', required: true },
     distillation: {
       type: 'object', required: true, additionalProperties: false,
       properties: {
@@ -433,6 +497,10 @@ const MEMORY_QUERY_OUTPUT_SCHEMA = {
           extractionMethod: { type: 'string', required: true },
           distillationModel: { type: 'string', required: true },
           sourceMemoryIds: { type: 'array', required: true, items: { type: 'string' } },
+          strategyTemplateId: { type: 'string', required: true },
+          reasoningLevel: { type: 'string', required: true },
+          insightConfidence: { type: 'number', required: true },
+          status: { type: 'string', required: true },
         },
       },
     },
@@ -446,6 +514,194 @@ const FEEDBACK_OUTPUT_SCHEMA = {
   properties: {
     updated: { type: 'integer', required: true },
     skipped: { type: 'integer', required: true },
+    templateUpdated: { type: 'integer', required: true },
+    note: { type: 'string', required: true },
+  },
+} as const
+
+const PLAN_OUTPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    pattern: { type: 'string', required: true, enum: ['multi_hop_qa', 'code_synthesis', 'tool_orchestration', 'gui_operation', 'long_horizon_planning', 'numeric_search', 'general'] },
+    confidence: { type: 'number', required: true },
+    evidence: {
+      type: 'array', required: true,
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          signal: { type: 'string', required: true },
+          hit: { type: 'json', required: true },
+          weight: { type: 'number', required: true },
+        },
+      },
+    },
+    scores: { type: 'json', required: true },
+    fallback: { type: 'boolean', required: true },
+    matchedTemplates: {
+      type: 'array', required: true,
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          templateId: { type: 'string', required: true },
+          name: { type: 'string', required: true },
+          description: { type: 'string', required: true },
+          taskPatterns: { type: 'array', required: true, items: { type: 'string' } },
+          steps: {
+            type: 'array', required: true,
+            items: {
+              type: 'object', additionalProperties: false,
+              properties: {
+                index: { type: 'integer', required: true },
+                title: { type: 'string', required: true },
+                moduleDemands: {
+                  type: 'array', required: true,
+                  items: {
+                    type: 'object', additionalProperties: false,
+                    properties: {
+                      kind: { type: 'string', required: true, enum: ['retrieve_memory', 'retrieve_template', 'use_skill', 'invoke_tool', 'verify', 'rollback_check'] },
+                      intent: { type: 'string', required: true },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          structureSignature: { type: 'array', required: true, items: { type: 'string' } },
+          activeRetrievalPoints: { type: 'array', required: true, items: { type: 'integer' } },
+          score: { type: 'number', required: true },
+          breakdown: {
+            type: 'object', required: true, additionalProperties: false,
+            properties: {
+              struct: { type: 'number', required: true },
+              lexical: { type: 'number', required: true },
+              pattern: { type: 'number', required: true },
+              quality: { type: 'number', required: true },
+            },
+          },
+          strongMatch: { type: 'boolean', required: true },
+          injectable: { type: 'boolean', required: true },
+          deprecated: { type: 'boolean', required: true },
+          utility: {
+            type: 'object', required: true, additionalProperties: false,
+            properties: {
+              helpful: { type: 'integer', required: true },
+              harmful: { type: 'integer', required: true },
+              neutral: { type: 'integer', required: true },
+            },
+          },
+        },
+      },
+    },
+    recommendedSkills: {
+      type: 'array', required: true,
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          name: { type: 'string', required: true },
+          description: { type: 'string', required: true },
+        },
+      },
+    },
+    plan: { type: 'string', required: true },
+    audit: { type: 'json', required: true },
+    note: { type: 'string', required: true },
+  },
+} as const
+
+const TEMPLATE_LIST_OUTPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    count: { type: 'integer', required: true },
+    templates: {
+      type: 'array', required: true,
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          templateId: { type: 'string', required: true },
+          name: { type: 'string', required: true },
+          description: { type: 'string', required: true },
+          taskPatterns: { type: 'array', required: true, items: { type: 'string' } },
+          version: { type: 'integer', required: true },
+          status: { type: 'string', required: true, enum: ['active', 'deprecated'] },
+          utility: {
+            type: 'object', required: true, additionalProperties: false,
+            properties: {
+              helpful: { type: 'integer', required: true },
+              harmful: { type: 'integer', required: true },
+              neutral: { type: 'integer', required: true },
+            },
+          },
+        },
+      },
+    },
+    note: { type: 'string', required: true },
+  },
+} as const
+
+const TEMPLATE_LOAD_OUTPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    found: { type: 'boolean', required: true },
+    templateId: { type: 'string', required: true },
+    name: { type: 'string', required: true },
+    description: { type: 'string', required: true },
+    taskPatterns: { type: 'array', required: true, items: { type: 'string' } },
+    steps: {
+      type: 'array', required: true,
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          index: { type: 'integer', required: true },
+          title: { type: 'string', required: true },
+          moduleDemands: {
+            type: 'array', required: true,
+            items: {
+              type: 'object', additionalProperties: false,
+              properties: {
+                kind: { type: 'string', required: true, enum: ['retrieve_memory', 'retrieve_template', 'use_skill', 'invoke_tool', 'verify', 'rollback_check'] },
+                intent: { type: 'string', required: true },
+              },
+            },
+          },
+        },
+      },
+    },
+    structureSignature: { type: 'array', required: true, items: { type: 'string' } },
+    preconditions: { type: 'array', required: true, items: { type: 'string' } },
+    provenance: {
+      type: 'object', required: true, additionalProperties: false,
+      properties: {
+        author: { type: 'string', required: true, enum: ['builtin', 'mined', 'caller'] },
+        sourceMemoryIds: { type: 'array', required: true, items: { type: 'string' } },
+        sourceTaskIds: { type: 'array', required: true, items: { type: 'string' } },
+      },
+    },
+    utility: {
+      type: 'object', required: true, additionalProperties: false,
+      properties: {
+        helpful: { type: 'integer', required: true },
+        harmful: { type: 'integer', required: true },
+        neutral: { type: 'integer', required: true },
+      },
+    },
+    version: { type: 'integer', required: true },
+    status: { type: 'string', required: true, enum: ['active', 'deprecated'] },
+    note: { type: 'string', required: true },
+  },
+} as const
+
+const TEMPLATE_PUBLISH_OUTPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    published: { type: 'boolean', required: true },
+    templateId: { type: 'string', required: true },
+    name: { type: 'string', required: true },
+    version: { type: 'integer', required: true },
+    structureSignature: { type: 'array', required: true, items: { type: 'string' } },
     note: { type: 'string', required: true },
   },
 } as const
@@ -595,9 +851,50 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const domain = await ctx.storageDomain.open(reasoningMemoryDomain)
   const memories = domain.table('memories')
   const retrievals = domain.table('retrievals')
+  const templates = domain.table('templates')
   const skillsDomain = await ctx.storageDomain.open(reasoningMemorySkillsDomain)
   const skills = skillsDomain.table('skills')
   const lexicalIndex = new LexicalMemoryIndex([...memories.entries()].map(([, item]) => item))
+
+  // Startup environment gate: the Python core needs 3.10+; an incompatible or
+  // missing interpreter surfaces here as a readable error before any bridge
+  // call fails later with an opaque spawn failure.
+  const pythonVersionCheck = checkPythonVersion(config.pythonExecutable!)
+  if (!pythonVersionCheck.ok) {
+    ctx.logger.error(`reasoning-memory: ${pythonVersionCheck.message}`)
+  }
+
+  // Idempotent seeding of the five builtin templates (final spec 4.4). The
+  // records come from the Python core so the step/module-demand derivation
+  // stays single-sourced. A failed attempt is NOT cached: the promise is
+  // reset so the next plan/list/load call retries the seeding, keeping a
+  // transient python failure from emptying the template layer until restart.
+  let templatesSeeded: Promise<void> | undefined
+  const seedTemplates = async (): Promise<void> => {
+    try {
+      const result = await runReasoningCore<{ templates: StrategyTemplate[] }>(
+        config.pythonExecutable!, { operation: 'builtin_templates' }, new AbortController().signal,
+      )
+      for (const record of result.templates) {
+        if (templates.get(record.templateId)) continue
+        await templates.put(record.templateId, strategyTemplateSchema.parse(record))
+      }
+    } catch (error) {
+      templatesSeeded = undefined
+      ctx.logger.warn(`reasoning-memory: builtin template seeding failed (will retry on the next template call): ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  const ensureTemplatesSeeded = (): Promise<void> => {
+    templatesSeeded ??= seedTemplates()
+    return templatesSeeded
+  }
+  void ensureTemplatesSeeded()
+
+  // Distinct-task harmful feedback window for the conservative deprecation
+  // mark (final spec 5). Persisted on each memory as a bounded recent-task
+  // list, so the count survives restarts.
+  const MAX_HARMFUL_TASK_IDS = 8
+  const harmfulDeprecationLimit = Number(config.deprecatedAfterHarmfulFeedback ?? 0)
   const activeBySession = new Map<string, ActiveTask>()
   const activeByTaskId = new Map<string, ActiveTask>()
   const ignoredMemoryCalls = new Map<string, Set<string>>()
@@ -749,7 +1046,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         (!filter.outcome || item.outcome === filter.outcome)
         && (!filter.type || item.type === filter.type)
         && (!filter.trustLevel || item.trustLevel === filter.trustLevel)
-        && (!filter.taskScope || (item.taskScope || '').includes(filter.taskScope)))
+        && (!filter.taskScope || (item.taskScope || '').includes(filter.taskScope))
+        && (!filter.status || (item.status ?? 'active') === filter.status)
+        && (!filter.strategyTemplateId || (item.strategyTemplateId ?? '') === filter.strategyTemplateId)
+        && (!filter.reasoningLevel || (item.reasoningLevel ?? 'path') === filter.reasoningLevel))
       .sort((left, right) => {
         const difference = (Number(left[sortKey] ?? 0) - Number(right[sortKey] ?? 0)) * direction
         return difference !== 0 ? difference : left.memoryId.localeCompare(right.memoryId)
@@ -780,6 +1080,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       extractionMethod: item.extractionMethod ?? 'caller_insight',
       distillationModel: item.distillationModel ?? '',
       sourceMemoryIds: item.sourceMemoryIds ?? [],
+      strategyTemplateId: item.strategyTemplateId ?? '',
+      reasoningLevel: item.reasoningLevel ?? 'path',
+      insightConfidence: item.insightConfidence ?? 0,
+      status: item.status ?? 'active',
     }))
   }
   let enterpriseRuleRag: EnterpriseRuleRag | undefined
@@ -953,6 +1257,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         pendingToolNames: new Map(),
         retrievedMemoryIds: new Set(),
         feedbackMemoryIds: new Set(),
+        planTemplateIds: new Set(),
+        templateFeedbackRecorded: new Set(),
         reasoningText: '',
         reasoningCaptureStatus: config.captureReasoningEnabled ? 'not-provided' : 'disabled',
         capturedModel: null,
@@ -979,6 +1285,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       route: { type: 'string', enum: ['auto', 'semantic', 'structure', 'graph', 'hybrid'], description: 'Retrieval route. Auto uses vector candidate search when enabled; hybrid fuses dense vector, lexical, action-structure, and logical-graph rankings.' },
       include_enterprise_rules: { type: 'boolean', description: 'Retrieve relevant enterprise rule excerpts when the profile enables rule RAG. Defaults to the profile setting; a profile marked required cannot be overridden.' },
       reasoning_graph_json: { type: 'string', description: 'Optional compact task logic graph JSON. Shape: {"version":1,"nodes":[{"id":"p1","kind":"premise","text":"..."},{"id":"i1","kind":"inference","text":"..."},{"id":"c1","kind":"conclusion","text":"..."}],"edges":[{"sourceId":"p1","targetId":"i1","relation":"supports"},{"sourceId":"i1","targetId":"c1","relation":"leads_to"}]}. Use concise evidence-grounded steps, not full chain-of-thought.' },
+      active_template_id: { type: 'string', description: 'Optional strategy template id from memory_plan_task; binds the retrieval to that template step plan and enables the template ranking channel.' },
+      step_index: { type: 'integer', description: 'Optional template step index this retrieval serves; recorded in the retrieval audit only.' },
+      retrieval_intent: { type: 'string', enum: ['retrieve_memory', 'retrieve_template', 'use_skill', 'invoke_tool', 'verify', 'rollback_check'], description: 'Optional module-demand intent for this step; invalid values are ignored and audited.' },
+      include_deprecated: { type: 'boolean', description: 'Include memories marked deprecated in the results. Defaults to true; deprecated memories always carry a deprecated flag.' },
     },
     output: { schema: RETRIEVE_OUTPUT_SCHEMA, render: renderJson },
     async execute(args, exec) {
@@ -997,6 +1307,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         content: item.content,
         feedback: item.feedback ?? { helpful: 0, harmful: 0, neutral: 0 },
         structureSignature: item.structureSignature,
+        strategyTemplateId: item.strategyTemplateId ?? '',
+        status: item.status ?? 'active',
         provenance: { taskId: item.provenance.taskId },
         lexicalScore,
         vectorScore,
@@ -1113,6 +1425,19 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         })
       }
 
+      const activeTemplateId = typeof args.active_template_id === 'string' && args.active_template_id.trim()
+        ? clipText(args.active_template_id, 100)
+        : ''
+      await ensureTemplatesSeeded()
+      const activeTemplate = activeTemplateId ? templates.get(activeTemplateId) : undefined
+      const stepIndex = Number.isInteger(args.step_index) ? Math.max(0, Math.min(1000, Number(args.step_index))) : 0
+      const retrievalIntent = typeof args.retrieval_intent === 'string'
+        && ['retrieve_memory', 'retrieve_template', 'use_skill', 'invoke_tool', 'verify', 'rollback_check'].includes(args.retrieval_intent)
+        ? args.retrieval_intent
+        : ''
+      const includeDeprecated = args.include_deprecated !== false
+      const intentIgnored = typeof args.retrieval_intent === 'string' && !retrievalIntent
+
       const reasoningResultPromise = runReasoningCore<RetrievalResponse>(config.pythonExecutable!, {
         operation: 'retrieve',
         query,
@@ -1120,6 +1445,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         memories: retrievalMemories,
         excludeTaskId: active?.taskId ?? '',
         queryGraphJson: clipText(args.reasoning_graph_json ?? '', 30000),
+        activeTemplateId,
+        activeTemplate,
+        stepIndex,
+        retrievalIntent,
+        includeDeprecated,
         k: requestedK,
         route,
         positiveNegativeRatio: config.positiveNegativeRatio,
@@ -1167,12 +1497,17 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           graphScore: row.graphScore,
           lexicalScore: row.lexicalScore,
           vectorScore: row.vectorScore,
+          templateScore: row.templateScore,
+          deprecated: row.deprecated,
           combinedScore: row.combinedScore,
           utilityMultiplier: row.utilityMultiplier,
           sourceSessionId: item.provenance.sourceSessionId,
           sourceEventSeqs: item.provenance.eventSeqs,
         }]
       })
+      // The Python core already excluded deprecated memories before the
+      // positive/negative quota selection when include_deprecated is false,
+      // so the returned rows and the balance counts always agree.
       const retrievalId = randomUUID()
       const audit = retrievalRecordSchema.parse({
         retrievalId,
@@ -1182,6 +1517,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         route,
         requestedK,
         positiveNegativeRatio: config.positiveNegativeRatio,
+        activeTemplateId,
+        stepIndex,
+        retrievalIntent,
+        templateChannelWeight: result.templateChannelWeight ?? 0,
+        deprecatedFilteredCount: result.deprecatedFilteredCount ?? 0,
         relevanceThreshold: config.relevanceThreshold,
         thresholdFilteredCount: result.balance.thresholdFilteredCount,
         fusionWeights: result.fusionWeights,
@@ -1213,9 +1553,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         route,
         fusionMode: result.fusionMode,
         queryHash: result.queryHash,
-        note: [vectorWarning, enterpriseRuleWarning, result.reason, result.balance.fallbackUsed
-          ? 'The requested positive:negative ratio could not be fully met; available outcomes filled the remaining slots.'
-          : 'Ranking combines lexical reasoning overlap, optional dense-vector candidates, action structure, typed-graph similarity, and bounded feedback. Positive/negative outcome quotas are applied after ranking. Memories remain unverified.',
+        note: [
+          vectorWarning,
+          enterpriseRuleWarning,
+          activeTemplateId && !activeTemplate ? 'The requested active_template_id does not exist in the template bank; retrieval ran without a template channel.' : '',
+          intentIgnored ? 'The retrieval_intent value was not a module-demand kind and was ignored.' : '',
+          (result.deprecatedFilteredCount ?? 0) > 0 ? `${result.deprecatedFilteredCount} deprecated memories were excluded before quota selection because include_deprecated was false.` : '',
+          result.reason,
+          result.balance.fallbackUsed
+            ? 'The requested positive:negative ratio could not be fully met; available outcomes filled the remaining slots.'
+            : 'Ranking combines lexical reasoning overlap, optional dense-vector candidates, action structure, typed-graph similarity, template alignment, and bounded feedback. Positive/negative outcome quotas are applied after ranking. Memories remain unverified.',
           'Fewer, highly relevant memories beat more marginal ones; before acting, explicitly state which returned memories actually apply to the current subproblem, which do not, and why.',
         ]
           .filter(Boolean).join(' '),
@@ -1232,10 +1579,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   ctx.tools.register(defineTool({
     name: 'memory_feedback',
-    description: 'Give one bounded usefulness signal for memories retrieved in the active task after observing its outcome. This can slightly adjust future ranking; it is self-reported feedback, not proof that a memory is correct. The evidence text is discarded.',
+    description: 'Give one bounded usefulness signal for memories retrieved or templates planned in the active task. Memory ratings slightly adjust future ranking; template ratings feed the template utility statistics. Both are self-reported, not proof of correctness. The evidence text is discarded.',
     parameters: {
-      memory_ids: { type: 'array', required: true, items: { type: 'string' }, description: 'Up to 20 memory IDs returned by memory_retrieve in this active task.' },
-      rating: { type: 'string', required: true, enum: ['helpful', 'harmful', 'neutral'], description: 'Whether applying the reasoning lesson helped, misled, or had no clear effect.' },
+      memory_ids: { type: 'array', items: { type: 'string' }, description: 'Up to 20 memory IDs returned by memory_retrieve in this active task. Optional when rating a template.' },
+      template_id: { type: 'string', description: 'Optional strategy template id returned by memory_plan_task in this active task. Each template can be rated once per task.' },
+      step_index: { type: 'integer', description: 'Optional template step index this rating refers to. Discarded, like the evidence text.' },
+      rating: { type: 'string', required: true, enum: ['helpful', 'harmful', 'neutral'], description: 'Whether applying the reasoning lesson or the template plan helped, misled, or had no clear effect.' },
       evidence: { type: 'string', required: true, description: 'Short basis for the rating. It is used for this call only and is not stored.' },
     },
     output: { schema: FEEDBACK_OUTPUT_SCHEMA, render: renderJson },
@@ -1243,42 +1592,97 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const sessionId = getSessionIdFromAgent(exec.agent) ?? ''
       const active = activeBySession.get(sessionId)
       if (!active) {
-        return { updated: 0, skipped: args.memory_ids.length, note: 'Start an active task and retrieve memories before feedback.' }
+        return { updated: 0, skipped: (args.memory_ids ?? []).length, templateUpdated: 0, note: 'Start an active task and retrieve memories or plan templates before feedback.' }
       }
       if (!clipText(args.evidence, 1000)) throw new Error('evidence must not be empty')
-      const uniqueIds = [...new Set(args.memory_ids)].slice(0, 20)
+      const notes: string[] = []
+
+      let templateUpdated = 0
+      const templateId = typeof args.template_id === 'string' && args.template_id.trim()
+        ? clipText(args.template_id, 100)
+        : ''
+      if (templateId) {
+        if (!active.planTemplateIds.has(templateId)) {
+          notes.push(`template '${templateId}' was not returned by memory_plan_task in this task and cannot be rated.`)
+        } else if (active.templateFeedbackRecorded.has(templateId)) {
+          notes.push(`template '${templateId}' was already rated in this task; each template can be rated once per task.`)
+        } else {
+          const template = templates.get(templateId)
+          if (!template) {
+            notes.push(`template '${templateId}' no longer exists in the template bank.`)
+          } else {
+            const templateResult = await runReasoningCore<{ templateId: string; utility: StrategyTemplate['utility'] }>(
+              config.pythonExecutable!, {
+                operation: 'template_feedback',
+                template,
+                verdict: args.rating,
+              }, exec.signal,
+            )
+            const nextTemplate = strategyTemplateSchema.parse({
+              ...template,
+              utility: templateResult.utility,
+              updatedAt: Date.now(),
+            })
+            await templates.put(templateId, nextTemplate)
+            active.templateFeedbackRecorded.add(templateId)
+            templateUpdated++
+          }
+        }
+      }
+
+      const uniqueIds = [...new Set(args.memory_ids ?? [])].slice(0, 20)
       const eligibleIds = uniqueIds.filter(id =>
         active.retrievedMemoryIds.has(id) && !active.feedbackMemoryIds.has(id),
       )
       const items = eligibleIds
         .map(id => memories.get(id))
         .filter((item): item is MemoryItem => Boolean(item))
-      let skipped = args.memory_ids.length - items.length
-      if (items.length === 0) {
-        return { updated: 0, skipped, note: 'Only memories retrieved in this task can be rated, and each can be rated once per task.' }
-      }
-      const updateResult = await runReasoningCore<{
-        updates: Array<{ memoryId: string; feedback: MemoryItem['feedback'] }>
-      }>(config.pythonExecutable!, {
-        operation: 'feedback',
-        memories: items,
-        rating: args.rating,
-      }, exec.signal)
+      let skipped = uniqueIds.length - items.length
       let updated = 0
-      for (const update of updateResult.updates) {
-        const item = memories.get(update.memoryId)
-        if (!item) continue
-        const next = memoryItemSchema.parse({ ...item, feedback: update.feedback, updatedAt: Date.now() })
-        await memories.put(update.memoryId, next)
-        builtinWrite(store => store.upsert(next))
-        active.feedbackMemoryIds.add(update.memoryId)
-        updated++
+      if (items.length === 0) {
+        if (templateUpdated === 0 && templateId) {
+          return { updated: 0, skipped, templateUpdated, note: notes.join(' ') || 'Only memories retrieved in this task can be rated, and each can be rated once per task.' }
+        }
+        if (templateUpdated === 0) {
+          return { updated: 0, skipped, templateUpdated, note: 'Only memories retrieved in this task can be rated, and each can be rated once per task.' }
+        }
+      } else {
+        const updateResult = await runReasoningCore<{
+          updates: Array<{ memoryId: string; feedback: MemoryItem['feedback'] }>
+        }>(config.pythonExecutable!, {
+          operation: 'feedback',
+          memories: items,
+          rating: args.rating,
+        }, exec.signal)
+        for (const update of updateResult.updates) {
+          const item = memories.get(update.memoryId)
+          if (!item) continue
+          let status = item.status ?? 'active'
+          let harmfulTaskIds = item.harmfulTaskIds ?? []
+          if (harmfulDeprecationLimit > 0 && args.rating === 'harmful') {
+            if (!harmfulTaskIds.includes(active.taskId)) {
+              // Bounded recent-task window: drop the oldest entry when full.
+              harmfulTaskIds = [...harmfulTaskIds, active.taskId].slice(-MAX_HARMFUL_TASK_IDS)
+            }
+            if (status === 'active' && harmfulTaskIds.length >= harmfulDeprecationLimit) {
+              status = 'deprecated'
+              notes.push(`memory '${update.memoryId}' received harmful feedback from ${harmfulTaskIds.length} distinct tasks and was marked deprecated (it still participates in retrieval).`)
+            }
+          }
+          const next = memoryItemSchema.parse({ ...item, feedback: update.feedback, status, harmfulTaskIds, updatedAt: Date.now() })
+          await memories.put(update.memoryId, next)
+          builtinWrite(store => store.upsert(next))
+          active.feedbackMemoryIds.add(update.memoryId)
+          updated++
+        }
+        skipped += items.length - updated
       }
-      skipped += items.length - updated
       return {
         updated,
         skipped,
-        note: 'Aggregate self-reported counts persist; the evidence text was discarded and cannot promote trustLevel.',
+        templateUpdated,
+        note: [...notes, 'Aggregate self-reported counts persist; the evidence text was discarded and cannot promote trustLevel.']
+          .filter(Boolean).join(' '),
       }
     },
   }))
@@ -1306,19 +1710,24 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       },
       distill_with_llm: { type: 'boolean', description: 'LLM distillation of the captured trajectory (abstract actions, optional reasoning record, evidence) into structured memory items. Only runs when the profile enables llmDistillationEnabled; pass false to opt out for this call and submit your own insight or memory_items instead.' },
       reasoning_graph_json: { type: 'string', description: 'Optional compact DAG of premises, inferences, actions, evidence, and conclusion using the documented version-1 node/edge schema. This is a concise rationale graph, not hidden chain-of-thought; invalid/cyclic graphs are rejected. Allowed only for a single memory item; if omitted, the Python core creates a provenance-labeled fallback graph per item.' },
+      insight_confidence: { type: 'number', description: 'Optional self-assessed insight confidence (0 to 1) applied to every item of this call. When the profile sets minInsightConfidence above 0, items below that gate are rejected; no value counts as 0. This is a write policy, not a calibrated quality verdict.' },
     },
     output: { schema: SAVE_OUTPUT_SCHEMA, render: renderJson },
     async execute(args, exec) {
       const sessionId = getSessionIdFromAgent(exec.agent) ?? ''
       const active = activeBySession.get(sessionId)
       if (!active) {
-        return { stored: false, reason: 'No active task. Call memory_begin_task before collecting an outcome.', memoryIds: [], trustLevel: 'not-applicable' as const, distillation: { method: 'not-applicable' as const, model: '' } }
+        return { stored: false, reason: 'No active task. Call memory_begin_task before collecting an outcome.', memoryIds: [], trustLevel: 'not-applicable' as const, gateRejectedCount: 0, distillation: { method: 'not-applicable' as const, model: '' } }
       }
       const outcome = args.outcome as 'success' | 'fail' | 'partial' | 'unknown'
       const admittedOutcome = outcome === 'success' || outcome === 'fail' ? outcome : null
       const verifier = clipText(args.verifier, 200)
       const evidence = clipText(args.evidence, 2000)
       const graphJson = clipText(args.reasoning_graph_json ?? '', 30000)
+      const insightConfidence = typeof args.insight_confidence === 'number' && Number.isFinite(args.insight_confidence)
+        ? Math.max(0, Math.min(1, args.insight_confidence))
+        : 0
+      const minInsightConfidence = Math.max(0, Math.min(1, Number(config.minInsightConfidence ?? 0)))
 
       const callerItems: DistilledMemoryItem[] = []
       if (Array.isArray(args.memory_items)) {
@@ -1434,6 +1843,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         distillationModel,
         sourceMemoryIds: [],
         items,
+        insightConfidence,
+        minInsightConfidence,
         maxItemsPerOutcome: config.maxMemoryItemsPerOutcome,
         deSpecificationThreshold: config.deSpecificationThreshold,
       }, exec.signal)
@@ -1443,6 +1854,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           reason: [result.reason, distillationNote].filter(Boolean).join(' '),
           memoryIds: [],
           trustLevel: 'not-applicable' as const,
+          gateRejectedCount: result.gateRejectedCount ?? 0,
           distillation: { method: extractionMethod, model: distillationModel },
         }
       }
@@ -1483,6 +1895,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           .filter(Boolean).join(' '),
         memoryIds: storedItems.map(item => item.memoryId),
         trustLevel: 'unverified' as const,
+        gateRejectedCount: result.gateRejectedCount ?? 0,
         distillation: { method: extractionMethod, model: distillationModel },
       }
     },
@@ -1628,6 +2041,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       type: { type: 'string', enum: ['strategy', 'structure', 'failure'], description: 'Only this memory type.' },
       trust_level: { type: 'string', enum: ['verified', 'unverified', 'unknown'], description: 'Only this trust level.' },
       task_scope: { type: 'string', description: 'Substring filter on the task family/scope label.' },
+      status: { type: 'string', enum: ['active', 'deprecated'], description: 'Only memories with this conservative deprecation status.' },
+      strategy_template_id: { type: 'string', description: 'Only memories aligned to this strategy template id.' },
+      reasoning_level: { type: 'string', enum: ['analysis', 'path', 'step'], description: 'Only memories at this reasoning level.' },
       limit: { type: 'integer', description: 'Max rows (default 20, max 100).' },
       offset: { type: 'integer', description: 'Skip this many rows (default 0).' },
       sort_by: { type: 'string', enum: ['created_at', 'updated_at', 'confidence'], description: 'Sort field (default created_at).' },
@@ -1642,6 +2058,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         taskScope: typeof args.task_scope === 'string' && args.task_scope.trim()
           ? clipText(args.task_scope, 200)
           : undefined,
+        status: args.status as StructuredQueryFilter['status'],
+        strategyTemplateId: typeof args.strategy_template_id === 'string' && args.strategy_template_id.trim()
+          ? clipText(args.strategy_template_id, 100)
+          : undefined,
+        reasoningLevel: args.reasoning_level as StructuredQueryFilter['reasoningLevel'],
         limit: Math.floor(args.limit ?? 20),
         offset: Math.floor(args.offset ?? 0),
         sortBy: (args.sort_by as StructuredQueryFilter['sortBy']) ?? 'created_at',
@@ -1676,6 +2097,253 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         note = 'The built-in store is disabled in this profile; rows were scanned from the canonical memory store.'
       }
       return { count: items.length, items, note }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'memory_plan_task',
+    description: 'Classify the current task into a task pattern and return the best-matching strategy templates with their step-level module demands and proactive retrieval points. This is the joint retrieval and activation planning surface; templates are guidance, not orders. Matching templates are recorded for this task so memory_feedback can rate them.',
+    parameters: {
+      task_desc: { type: 'string', required: true, description: 'Short task description, the same text you would pass to memory_begin_task.' },
+      goal: { type: 'string', description: 'Intended result, if distinct from the task description.' },
+      task_family: { type: 'string', description: 'Optional task family or repository label; it strongly informs the pattern classification.' },
+      max_templates: { type: 'integer', description: 'Maximum matched templates to return; defaults to 2 and is capped at 10.' },
+    },
+    output: { schema: PLAN_OUTPUT_SCHEMA, render: renderJson },
+    async execute(args, exec) {
+      const sessionId = getSessionIdFromAgent(exec.agent) ?? ''
+      const active = activeBySession.get(sessionId)
+      await ensureTemplatesSeeded()
+      const templateList = [...templates.entries()].map(([, record]) => record)
+      const taskDesc = clipText(args.task_desc, 4000)
+      if (!taskDesc) throw new Error('task_desc must not be empty')
+      const maxTemplates = Number.isInteger(args.max_templates) ? Math.max(1, Math.min(10, Number(args.max_templates))) : 2
+      const templateMatchMin = Math.max(0, Math.min(1, Number(config.templateMatchMin ?? 0.55)))
+      const result = await runReasoningCore<PlanResponse>(config.pythonExecutable!, {
+        operation: 'plan_task',
+        taskDesc,
+        goal: clipText(args.goal ?? '', 4000),
+        taskFamily: clipText(args.task_family ?? '', 200),
+        events: active?.events ?? [],
+        hasGraph: false,
+        graphNodeKinds: [],
+        templates: templateList,
+        maxTemplates,
+        templateMatchMin,
+      }, exec.signal)
+      const matchedIds = result.matchedTemplates.map(template => template.templateId)
+      if (active) {
+        active.planTemplateIds.clear()
+        for (const templateId of matchedIds) active.planTemplateIds.add(templateId)
+      }
+      // Recommended skills: read-only keyword match against the published
+      // skill list using the classified pattern and the top template name.
+      const keywordParts = new Set<string>([
+        result.pattern.replace(/_/g, '-'),
+        ...result.matchedTemplates.slice(0, 1).flatMap(template =>
+          template.name.replace(/^memory_tpl_/, '').split('-'),
+        ),
+      ].filter(part => part.length >= 4))
+      const recommendedSkills = [...skills.entries()]
+        .map(([, record]) => record)
+        .filter(record => [...keywordParts].some(part =>
+          record.name.includes(part) || record.description.toLocaleLowerCase().includes(part)))
+        .sort((left, right) => left.name.localeCompare(right.name))
+        .slice(0, 3)
+        .map(record => ({ name: record.name, description: record.description }))
+      const belowThreshold = result.matchedTemplates.length === 0
+        || result.matchedTemplates[0].score < templateMatchMin
+      return {
+        ...result,
+        matchedTemplates: result.matchedTemplates.map(template => ({
+          templateId: template.templateId,
+          name: template.name,
+          description: template.description,
+          taskPatterns: template.taskPatterns,
+          steps: template.steps,
+          structureSignature: template.structureSignature,
+          activeRetrievalPoints: template.activeRetrievalPoints,
+          score: template.score,
+          breakdown: template.breakdown,
+          strongMatch: template.strongMatch,
+          injectable: template.injectable,
+          deprecated: template.deprecated,
+          utility: template.utility,
+        })),
+        recommendedSkills,
+        note: belowThreshold
+          ? 'No template cleared the match threshold; proceed in general mode instead of forcing a template onto this task.'
+          : 'Template steps and module demands are guidance; re-verify every result in the current environment and rate the template with memory_feedback afterwards.',
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'memory_list_templates',
+    description: 'List strategy templates (layer 1 of progressive disclosure: metadata only). Use memory_load_template to see a full template with its steps and module demands.',
+    parameters: {
+      pattern: { type: 'string', enum: ['multi_hop_qa', 'code_synthesis', 'tool_orchestration', 'gui_operation', 'long_horizon_planning', 'numeric_search', 'general'], description: 'Only templates declaring this task pattern.' },
+      include_deprecated: { type: 'boolean', description: 'Include deprecated templates; defaults to true.' },
+    },
+    output: { schema: TEMPLATE_LIST_OUTPUT_SCHEMA, render: renderJson },
+    async execute(args) {
+      await ensureTemplatesSeeded()
+      const includeDeprecated = args.include_deprecated !== false
+      const pattern = args.pattern as string | undefined
+      const records = [...templates.entries()]
+        .map(([, record]) => record)
+        .filter(record =>
+          (includeDeprecated || record.status !== 'deprecated')
+          && (!pattern || record.taskPatterns.includes(pattern as StrategyTemplate['taskPatterns'][number])))
+        .sort((left, right) => left.name.localeCompare(right.name))
+      return {
+        count: records.length,
+        templates: records.map(record => ({
+          templateId: record.templateId,
+          name: record.name,
+          description: record.description,
+          taskPatterns: record.taskPatterns,
+          version: record.version,
+          status: record.status,
+          utility: record.utility,
+        })),
+        note: 'Layer 1 of progressive disclosure: metadata only. Load a template with memory_load_template for its full steps and module demands.',
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'memory_load_template',
+    description: 'Load one strategy template by id (layer 2 of progressive disclosure): full steps, module demands, structure signature, preconditions, provenance summary, and utility. Deprecated templates stay loadable with their status flag.',
+    parameters: {
+      template_id: { type: 'string', required: true, description: 'The template id from memory_list_templates or memory_plan_task.' },
+    },
+    output: { schema: TEMPLATE_LOAD_OUTPUT_SCHEMA, render: renderJson },
+    async execute(args) {
+      await ensureTemplatesSeeded()
+      const record = templates.get(args.template_id)
+      if (!record) {
+        return {
+          found: false,
+          templateId: args.template_id,
+          name: '',
+          description: '',
+          taskPatterns: [],
+          steps: [],
+          structureSignature: [],
+          preconditions: [],
+          provenance: { author: 'builtin' as const, sourceMemoryIds: [], sourceTaskIds: [] },
+          utility: { helpful: 0, harmful: 0, neutral: 0 },
+          version: 0,
+          status: 'active' as const,
+          note: `no template named '${args.template_id}'; run memory_list_templates for the available ids.`,
+        }
+      }
+      return {
+        found: true,
+        templateId: record.templateId,
+        name: record.name,
+        description: record.description,
+        taskPatterns: record.taskPatterns,
+        steps: record.steps,
+        structureSignature: record.structureSignature,
+        preconditions: record.preconditions,
+        provenance: record.provenance,
+        utility: record.utility,
+        version: record.version,
+        status: record.status,
+        note: record.status === 'deprecated'
+          ? 'Layer 2 of progressive disclosure. This template is deprecated: re-verify each step in the current environment before following it.'
+          : 'Layer 2 of progressive disclosure. Template steps are guidance; verify results in the current environment.',
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'memory_publish_template',
+    description: 'Publish a caller-authored strategy template. Names must keep the memory_tpl_ prefix with a kebab-case body; descriptions must carry trigger phrasing and no em-dashes. Republishing the same name bumps its version instead of deleting the previous one.',
+    parameters: {
+      name: { type: 'string', required: true, description: 'Template name: memory_tpl_ prefix followed by kebab-case (lowercase letters, digits, hyphens), at most 80 characters.' },
+      description: { type: 'string', required: true, description: 'Model-facing trigger description (when/if/for, or 当/如果/提到/需要/时); no em-dashes; at most 400 characters.' },
+      task_patterns: { type: 'array', required: true, items: { type: 'string', enum: ['multi_hop_qa', 'code_synthesis', 'tool_orchestration', 'gui_operation', 'long_horizon_planning', 'numeric_search', 'general'] }, description: 'One or more task patterns this template applies to.' },
+      steps: {
+        type: 'array', required: true, description: '1 to 8 steps in execution order.',
+        items: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            index: { type: 'integer', required: true, description: 'Step number, starting at 1.' },
+            title: { type: 'string', required: true, description: 'Short step label.' },
+            module_demands: {
+              type: 'array', required: true, description: '1 to 4 module demands for this step.',
+              items: {
+                type: 'object', additionalProperties: false,
+                properties: {
+                  kind: { type: 'string', required: true, enum: ['retrieve_memory', 'retrieve_template', 'use_skill', 'invoke_tool', 'verify', 'rollback_check'] },
+                  intent: { type: 'string', description: 'What this demand should accomplish; used as a retrieval query hint.' },
+                },
+              },
+            },
+          },
+        },
+      },
+      preconditions: { type: 'array', items: { type: 'string' }, description: 'Conditions that should hold before applying this template.' },
+    },
+    output: { schema: TEMPLATE_PUBLISH_OUTPUT_SCHEMA, render: renderJson },
+    async execute(args) {
+      await ensureTemplatesSeeded()
+      const validation = await runReasoningCore<PublishValidateResponse>(config.pythonExecutable!, {
+        operation: 'publish_template_validate',
+        draft: {
+          name: args.name,
+          description: args.description,
+          task_patterns: args.task_patterns,
+          steps: args.steps,
+          preconditions: args.preconditions ?? [],
+        },
+      }, new AbortController().signal)
+      if (!validation.valid) {
+        return {
+          published: false,
+          templateId: '',
+          name: typeof args.name === 'string' ? clipText(args.name, 80) : '',
+          version: 0,
+          structureSignature: [],
+          note: validation.issues.join('; '),
+        }
+      }
+      const normalized = validation.normalized
+      const now = Date.now()
+      const existing = [...templates.entries()]
+        .map(([, record]) => record)
+        .find(record => record.name === normalized.name)
+      const record = strategyTemplateSchema.parse({
+        templateId: existing?.templateId ?? randomUUID(),
+        name: normalized.name,
+        description: normalized.description,
+        taskPatterns: normalized.taskPatterns,
+        steps: normalized.steps,
+        structureSignature: normalized.structureSignature,
+        preconditions: normalized.preconditions,
+        provenance: {
+          author: 'caller' as const,
+          sourceMemoryIds: [],
+          sourceTaskIds: [],
+        },
+        utility: existing?.utility ?? { helpful: 0, harmful: 0, neutral: 0 },
+        version: (existing?.version ?? 0) + 1,
+        status: 'active' as const,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+      })
+      await templates.put(record.templateId, record)
+      return {
+        published: true,
+        templateId: record.templateId,
+        name: record.name,
+        version: record.version,
+        structureSignature: record.structureSignature,
+        note: 'The template is caller-authored and carries no independently verified evidence; treat its steps as guidance.',
+      }
     },
   }))
 
@@ -1760,7 +2428,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         provenance: { sourceMemoryIds: ids, sourceSessionId: sessionId, publishedAt: now },
         version,
         trustLevel: 'unverified' as const,
-        extractorVersion: 'dsh-reasoning-memory/0.3.0',
+        extractorVersion: 'dsh-reasoning-memory/0.4.0',
         createdAt: existing?.createdAt ?? now,
         updatedAt: now,
       })

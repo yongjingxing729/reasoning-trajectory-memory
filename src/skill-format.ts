@@ -21,8 +21,10 @@ export const SKILL_RESOURCE_PATH_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}\.md$/
 export const SKILL_RESERVED_PREFIX = /^memory[-_]/
 const EM_DASH = /\u2014/
 // Trigger tokens that make a description a context pointer: the model decides
-// from these words when to reach for the skill. Bilingual on purpose.
-const TRIGGER_TOKENS = /\b(when|if|for|mention|ask|say|当|如果|提到|需要|时)\b/i
+// from these words when to reach for the skill. Bilingual on purpose: the CJK
+// tokens sit outside the word-boundary group because \b never matches at CJK
+// character edges (mirrors templates.py _TRIGGER_TOKENS).
+const TRIGGER_TOKENS = /\b(when|if|for|mention|ask|say)\b|当|如果|提到|需要|时/i
 
 export interface SkillResource {
   path: string

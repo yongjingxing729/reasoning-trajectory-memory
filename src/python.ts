@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -6,6 +6,30 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const workerPath = fileURLToPath(new URL('../python/reasoning_memory.py', import.meta.url))
+
+// One-shot Python version gate (Python 3.10+ is required by the core's
+// syntax). The probe uses an exit-code trick instead of capturing stdout so
+// it also works in sandboxes that deny pipe-based child stdio: the worker
+// exits 0 for a supported interpreter, 3 for an older one.
+export function checkPythonVersion(executable: string): { ok: boolean; message: string } {
+  try {
+    const probe = spawnSync(
+      executable,
+      ['-c', 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 3)'],
+      { stdio: 'ignore', windowsHide: true, timeout: 15_000 },
+    )
+    if (probe.error) {
+      return { ok: false, message: `cannot run the configured python executable '${executable}': ${probe.error.message}` }
+    }
+    if (probe.status === 0) return { ok: true, message: '' }
+    if (probe.status === 3) {
+      return { ok: false, message: `reasoning-memory requires Python 3.10+; '${executable}' reports an older version.` }
+    }
+    return { ok: false, message: `cannot verify the python version of '${executable}' (probe exited ${probe.status}).` }
+  } catch (error) {
+    return { ok: false, message: `cannot verify the python version of '${executable}': ${error instanceof Error ? error.message : String(error)}` }
+  }
+}
 
 // JSON stdin/stdout bridge into the Python core, with a file-transport
 // fallback: some host environments (sandboxed runtimes, restricted Windows

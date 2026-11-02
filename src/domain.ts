@@ -50,6 +50,15 @@ export const memoryItemSchema = z.object({
   distillationModel: z.string().default(''),
   sourceMemoryIds: z.array(z.string()).default([]),
   reasoningGraph: reasoningGraphSchema.default({ version: 1, nodes: [], edges: [] }),
+  // v0.4.0 strategy-template alignment fields. All additive with defaults;
+  // a deprecated memory still participates in retrieval and is only flagged.
+  strategyTemplateId: z.string().default(''),
+  reasoningLevel: z.enum(['analysis', 'path', 'step']).default('path'),
+  insightConfidence: z.number().min(0).max(1).default(0),
+  status: z.enum(['active', 'deprecated']).default('active'),
+  // Recent distinct tasks that rated this memory harmful. A bounded window,
+  // not a complete history; used by the conservative deprecation mark.
+  harmfulTaskIds: z.array(z.string()).default([]),
   feedback: z.object({
     helpful: z.number().int().nonnegative(),
     harmful: z.number().int().nonnegative(),
@@ -76,12 +85,63 @@ export const memoryItemSchema = z.object({
 
 export type MemoryItem = z.infer<typeof memoryItemSchema>
 
+// Strategy templates (final spec 2.1): the four-layer mapping's procedural
+// memory. The table is added to the existing v1 domain, so every field with a
+// default below must keep its default once real data exists.
+export const templateModuleDemandSchema = z.object({
+  kind: z.enum([
+    'retrieve_memory',
+    'retrieve_template',
+    'use_skill',
+    'invoke_tool',
+    'verify',
+    'rollback_check',
+  ]),
+  intent: z.string().default(''),
+})
+
+export const templateStepSchema = z.object({
+  index: z.number().int().positive(),
+  title: z.string(),
+  moduleDemands: z.array(templateModuleDemandSchema),
+})
+
+export const strategyTemplateSchema = z.object({
+  templateId: z.string(),
+  name: z.string(),
+  description: z.string(),
+  taskPatterns: z.array(z.enum([
+    'multi_hop_qa', 'code_synthesis', 'tool_orchestration',
+    'gui_operation', 'long_horizon_planning', 'numeric_search', 'general',
+  ])),
+  steps: z.array(templateStepSchema),
+  structureSignature: z.array(structureTag),
+  preconditions: z.array(z.string()).default([]),
+  provenance: z.object({
+    author: z.enum(['builtin', 'mined', 'caller']),
+    sourceMemoryIds: z.array(z.string()).default([]),
+    sourceTaskIds: z.array(z.string()).default([]),
+  }),
+  utility: z.object({
+    helpful: z.number().int().nonnegative().default(0),
+    harmful: z.number().int().nonnegative().default(0),
+    neutral: z.number().int().nonnegative().default(0),
+  }),
+  version: z.number().int().positive().default(1),
+  status: z.enum(['active', 'deprecated']).default('active'),
+  createdAt: z.number().int().nonnegative(),
+  updatedAt: z.number().int().nonnegative(),
+})
+
+export type StrategyTemplate = z.infer<typeof strategyTemplateSchema>
+
 const retrievalCandidateSchema = z.object({
   memoryId: z.string(),
   outcome: z.enum(['success', 'fail']),
   graphScore: z.number().min(0).max(1).default(0),
   lexicalScore: z.number().min(0).max(1).default(0),
   vectorScore: z.number().min(0).max(1).default(0),
+  templateScore: z.number().min(0).max(1).default(0),
   contextScore: z.number().min(0).max(1).default(0),
   reasoningScore: z.number().min(0).max(1).default(0),
   semanticScore: z.number().min(0).max(1),
@@ -106,6 +166,12 @@ export const retrievalRecordSchema = z.object({
   route: z.enum(['auto', 'semantic', 'structure', 'graph', 'hybrid']),
   requestedK: z.number().int().positive(),
   positiveNegativeRatio: z.number().positive(),
+  // v0.4.0 step-aligned retrieval audit. All additive with defaults.
+  activeTemplateId: z.string().default(''),
+  stepIndex: z.number().int().nonnegative().default(0),
+  retrievalIntent: z.string().default(''),
+  templateChannelWeight: z.number().min(0).max(1).default(0),
+  deprecatedFilteredCount: z.number().int().nonnegative().default(0),
   fusionWeights: z.object({
     // Defaults admit legacy v1 audits written with { semantic, structure }.
     context: z.number().min(0).max(1).default(0.45),
@@ -137,5 +203,6 @@ export const reasoningMemoryDomain = defineDomain({
   tables: {
     memories: domainTable<string, MemoryItem>(memoryItemSchema),
     retrievals: domainTable<string, RetrievalRecord>(retrievalRecordSchema),
+    templates: domainTable<string, StrategyTemplate>(strategyTemplateSchema),
   },
 })

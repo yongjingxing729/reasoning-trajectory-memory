@@ -41,8 +41,18 @@ requireFile('dist/api-config.js')
 
 // Python worker and the full core package.
 requireFile('python/reasoning_memory.py')
-for (const module of ['constants', 'distillation', 'feedback', 'reasoning_graph', 'retrieval', 'service', 'text_similarity', 'trajectory', '__init__']) {
+for (const module of ['constants', 'distillation', 'feedback', 'reasoning_graph', 'retrieval', 'service', 'templates', 'text_similarity', 'trajectory', '__init__']) {
   requireFile(`python/reasoning_memory_core/${module}.py`)
+}
+
+// The npm files whitelist is the shipping contract: the Python core must be
+// included and the offline evaluation harness must never ship.
+const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+if (!(manifest.files || []).some(entry => entry.includes('reasoning_memory_core'))) {
+  problems.push('package.json files[] does not include python/reasoning_memory_core/')
+}
+if ((manifest.files || []).some(entry => entry.includes('scripts'))) {
+  problems.push('package.json files[] must not ship scripts/ (the eval harness is local-only)')
 }
 
 // Documentation shipped with the bundle.

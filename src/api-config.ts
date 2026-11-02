@@ -121,14 +121,18 @@ function normalizeBaseUrl(raw: string): string {
   return raw.trim().replace(/\/+$/, '')
 }
 
-function hostMatchesRule(host: string, rule: string): boolean {
+export function hostMatchesRule(host: string, rule: string): boolean {
+  // noProxy semantics: a bare rule must match the whole host (equality), never
+  // a substring ("1.2" must not match 1.2.3.4 and "example.com" must not match
+  // badexample.com). ".domain" and "*.domain" keep their suffix wildcard
+  // semantics for subdomains.
   const normalized = rule.trim().toLowerCase()
   if (!normalized) return false
   const candidate = host.toLowerCase()
   if (candidate === normalized) return true
   if (normalized.startsWith('.')) return candidate.endsWith(normalized)
   if (normalized.startsWith('*.')) return candidate.endsWith(normalized.slice(1))
-  return candidate.includes(normalized)
+  return false
 }
 
 export class ApiConfigService {
