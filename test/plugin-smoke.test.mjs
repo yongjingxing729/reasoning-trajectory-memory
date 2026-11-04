@@ -158,6 +158,11 @@ test('the built bundle boots in a mock DSH host and runs the full memory lifecyc
       'memory_list_templates',
       'memory_load_template',
       'memory_publish_template',
+      'memory_import_document',
+      'memory_list_documents',
+      'memory_load_document',
+      'memory_retrieve_document',
+      'memory_delete_document',
     ]
     for (const name of expectedTools) assert.ok(tools.has(name), `tool ${name} should be registered`)
 

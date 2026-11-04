@@ -256,3 +256,58 @@ test('publish name follows the description and deprecated filtering precedes the
   assert.equal(withoutDeprecated.balance.positiveCount, withoutDeprecated.memories.filter(row => row.outcome === 'success').length)
   assert.ok(withoutDeprecated.note.includes('excluded before quota selection'))
 })
+
+// T-rag-debug R1: a document query with zero text overlap returns empty
+// results (never full-score rows manufactured from pattern/link alone), and
+// the tool note says so instead of presenting fabricated matches.
+test('document retrieval with zero text signal returns empty with a readable note', { timeout: 60_000 }, async () => {
+  const { ctx, tools, tables } = makeMockHost()
+  await apply(ctx, {
+    pythonExecutable,
+    maxMemories: 50, maxRetrievalRecords: 50, maxTrajectoryEvents: 1000, positiveNegativeRatio: 1,
+    vectorIndexEnabled: false, qdrantUrl: 'http://127.0.0.1:6333', qdrantCollection: 'reasoning_memories',
+    qdrantApiKeyEnv: 'QDRANT_API_KEY', embeddingUrl: '', embeddingModel: 'unused', embeddingDimension: 8,
+    embeddingApiKeyEnv: 'OPENAI_API_KEY', retrievalCandidatePoolSize: 100, vectorCandidatePoolSize: 100,
+    enterpriseRuleRagEnabled: false, enterpriseRuleRagRequired: false,
+    enterpriseRuleCollection: 'enterprise_reasoning_rules', enterpriseRuleSetId: '',
+    enterpriseRuleCandidatePoolSize: 20, enterpriseRuleResultLimit: 5, enterpriseRuleScoreThreshold: 0.3,
+    enterpriseRuleEmbeddingUrl: '', enterpriseRuleEmbeddingModel: '', enterpriseRuleEmbeddingDimension: 0,
+    enterpriseRuleQdrantApiKeyEnv: 'ENTERPRISE_RULES_QDRANT_API_KEY',
+    enterpriseRuleEmbeddingApiKeyEnv: 'ENTERPRISE_RULES_EMBEDDING_API_KEY',
+    captureReasoningEnabled: true, maxReasoningTextChars: 4000, llmDistillationEnabled: false,
+    llmDistillationTemperature: 1, distillationProvider: '', distillationModel: '',
+    maxMemoryItemsPerOutcome: 3, deSpecificationThreshold: 0.9, relevanceThreshold: 0,
+    memoryConsolidationEnabled: false, builtinStoreEnabled: false, builtinStoreDataDir: '',
+    apiConfigPath: '', skillsExportDir: '', minInsightConfidence: 0, deprecatedAfterHarmfulFeedback: 0,
+    templateMatchMin: 0.55,
+  })
+
+  const imported = await tools.get('memory_import_document').execute({
+    name: 'memory_doc_standards',
+    content: '# Code Standards\n\nEvery function name uses snake_case.\n',
+    task_patterns: ['code_synthesis'],
+  }, execFor('s1'))
+  assert.equal(imported.imported, true)
+
+  // A query with no token overlap with the corpus must yield an empty list,
+  // not chunks carrying a perfect score.
+  const miss = await tools.get('memory_retrieve_document').execute(
+    { query: 'zzzz qqqq wwww', k: 4 }, execFor('s1'),
+  )
+  assert.deepEqual(miss.documents, [])
+  assert.ok(miss.note.includes('No document chunk matched'))
+
+  // The audit row for the document retrieval stays parseable and isolated
+  // from the memory quota fields.
+  const audits = [...tables.get('retrievals').entries()].map(([, row]) => row)
+  const documentAudit = audits.find(row => row.route === 'document')
+  assert.ok(documentAudit)
+  assert.deepEqual(documentAudit.selectedMemoryIds, [])
+  assert.deepEqual(documentAudit.documentIds, [])
+
+  const hit = await tools.get('memory_retrieve_document').execute(
+    { query: 'snake case function naming', k: 4 }, execFor('s1'),
+  )
+  assert.equal(hit.documents.length >= 1, true)
+  assert.equal(hit.documents[0].docName, 'memory_doc_standards')
+})
