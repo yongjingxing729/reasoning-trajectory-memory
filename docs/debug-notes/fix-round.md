@@ -162,3 +162,42 @@
 2. 每次源码修改（src/、python/、test/）：`send_message` 简报 lead 并更新任务板。
 3. 修复完成后：`npm test` 全绿（本沙箱用逐文件直跑 + `npm run prepare` + `npm run test:python` 等价验证）+ `scripts/eval` 可运行。
 4. B20/B21/B24/B25 之外的新增源码修复需 lead 再次批准。
+
+---
+
+# T-rag-debug（task-24，v0.5.0 推理 RAG MVP）轮记录
+
+- 开始：2026-11-04。基线：prepare ✅ ｜ test:python 123/123 ✅ ｜ Node 直跑 40/40 ✅（含 documents.test.mjs）。
+- 读审范围：doc_chunking.py、doc_rag.py、service.py、constants.py（v0.5 增量）、document-domain.ts、document-index.ts、document-vector.ts、index.ts 文档工具段与输出 schema。
+
+## 对抗探测结果（先记录后修）
+
+| # | 状态 | 严重度 | 发现 | 位置 | 处置建议 |
+| --- | --- | --- | --- | --- | --- |
+| R1 | 确认 bug | 🟡 | mini-RRF 全空信号（lexical+vector 均无正分）时，pattern(=1.0 for general)+link(=1.0 hop0) 使每个块得满分 1.0：无匹配查询返回“满分块”，误导模型 | doc_rag.py:141-182（weighted 分支）+ 269-270 seeds | 修复：无任何文本信号（lexical/vector 全零）时返回空结果 + reason；TS note 已有 “No document chunk matched” 文案承接 |
+| R2 | 确认偏离 | 🟡 | spec §3.2 “最终分 = 基础分 × 0.6^hop” 未字面实现：衰减由 link 通道（权重 0.10）承载；等分时 hop-1 仅比 hop-0 低约 6%（加权）/rank 级（RRF），hop-1 高分块可反超 hop-0 种子 | doc_rag.py:303-328 | 请 lead 裁决：a) 字面 ×0.6^hop（多跳基本出不了 top-k，与召回意图冲突）；b) 保持通道实现，spec/注释/审计描述对齐实际语义（推荐） |
+| R3 | 确认缺陷 | 🟢 | “见第三章” vs 标题“第三章 详述”无法解析（section_index 只收 ASCII 数字前缀标题；中文章节号未注册） | doc_chunking.py:253-262（heading_index/section_index 构建） | 小修：标题 `第\s*([0-9一二三…]+)\s*章` 前缀注册进 section_index（数字键） |
+| R4 | 确认 off-by-one | 🟢 | `content_truncated = len(content) >= MAX_DOC_CONTENT_CHARS`：恰好等于上限时报 truncated 不实 | doc_chunking.py:119-120 | 改 `>` |
+| R5 | 观察 | 🟢 | 伪相关反馈在插件路径不可达（TS 工具无参数/无配置；Python 默认关） | service.py:95；index.ts:2807-2818 | 记录为已知局限（spec §3.2 “默认关”成立且恒关） |
+| R6 | 观察 | 🟢 | 查询展开中“命中查询词的词表条目”追加是空操作（词已在查询中）；真正的泛化来自 TASK_FAMILY_PATTERNS 键 | doc_rag.py:73-86 | 记录；待标注集校准 |
+| R7 | 观察 | 🟢 | 句边界含 `.`，超长段落切块时边界可能落在小数/版本号中间（内容不丢，仅切分位置） | doc_chunking.py:29 | 记录；MVP 可接受 |
+| R8 | 观察 | 🟢 | retrieve_document 全语料（chunks+documents）随桥传输；上限 200 文档×2000 块时载荷可达数百 MB | index.ts:2849-2852 | 已由开发者注释承认；记录为规模风险 |
+| R9 | 观察 | 🟢 | 文档检索审计 fusionWeights 硬编码 {lexical .45, vector .35}，不含 pattern/link（及 constrain 微调后的实际权重） | index.ts:2884 | 审计保真度不足；记录 |
+| R10 | 观察 | 🟢 | 锚点归一化不一致：标题 “Code Style” → codestyle 而锚点 #code-style 保留连字符 → 不匹配（同形不同分隔符） | doc_chunking.py:38,256-259 | 记录；待校准 |
+| ✅ | 验证通过 | — | 环安全（a↔b 仅 visited 一次）、visited/expand 上限、孤立块以种子身份参赛、pattern 软过滤 + patternFallback 审计（无 general 文档时返回空 + 可读 reason）、refs 跨块解析（锚点/§1.2）、constrain 意图微调、伪相关默认关、解耦零回归（记忆/模板/企业规则 123 项 Python 测试全绿）、旧审计 additive 读回（templates.test legacyAudit） | — | — |
+
+## 待 lead 裁决
+- R2（衰减语义：字面实现 vs 通道实现+文档对齐——推荐后者）。
+- 批准后实施 R1/R3/R4（小改）+ R2 按裁决执行；R5-R10 只记录。
+
+## 裁决与修复执行（2026-11-04）
+
+| 条目 | 裁决 | 执行 |
+| --- | --- | --- |
+| R1 | ✅ 批准修复 | doc_rag.py：pattern/link 通道计算后新增文本信号门——lexical+vector 全零时返回空结果（reason “no chunk matched the query text…”），audit seeds=0/visited=0。测试：DocumentAdversarialTests 3 项（零信号空结果×2 + 正信号正常检索）+ adversarial.test.mjs “document retrieval with zero text signal…”（TS 集成：documents [] + note “No document chunk matched” + 审计行 route='document' 可解析） |
+| R2 | ✅ 采纳通道实现（lead 同步 spec/设计文档措辞） | 不改代码；测试冻结语义：weighted 等分时种子胜过 hop-1；RRF 模式向量强的 hop-1 块可反超种子且 breakdown.link=0.6 可审计（2 项） |
+| R3 | ✅ 批准修复 | doc_chunking.py：新增 `_CHAPTER_HEADING_RE`，标题“第X章”（含中文数字）注册进 section_index 数字键 → “见第三章”解析成功。测试：test_chinese_chapter_heading_resolves_chapter_reference |
+| R4 | ✅ 批准修复 | doc_chunking.py：`content_truncated = original_length > MAX_DOC_CONTENT_CHARS`（原 >= 在恰好等于上限时误报）。测试：test_content_truncation_flag_is_strict（恰好 200000 不报、200001 报且 charCount=200000） |
+| R5–R10 | 📝 只记录 | 已记入上表观察项，未改代码 |
+
+**回归**：prepare ✅ ｜ test:python **131/131** ✅（新增 DocumentAdversarialTests 8 项）｜ Node 直跑 8 文件全绿（adversarial 6/6、documents、smoke 等）｜ scripts/eval ✅ 指标不变（recall 0.5714 / ndcg 0.4334 / quota 1.0 / selfRetrieval 0 / classify 1.0 / templateTop1 1.0）。解耦零回归确认：记忆/模板/企业规则路径未改一行（retrieval.py、templates.py、enterprise-rules-rag.ts 本轮零改动），domain 仅 retrievalRecordSchema additive 字段（developer 在 task-22 已加）。

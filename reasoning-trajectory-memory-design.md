@@ -672,6 +672,40 @@ reasoning-trajectory-memory/（本仓库根目录即 DSH 插件包）
 
 ---
 
+## 19. 推理检索 RAG 落地（2026-11-04 迭代，v0.5.0）
+
+### 19.1 定位与硬边界
+
+在四层映射骨架（§18）上新增第三个检索面：**推理检索 RAG**——用户导入公司开发规范等文档，插件做推理感知的检索（不只是关键词/向量召回，而是带上任务模式、策略模板步骤意图与推理图上下文做过滤、确定性查询展开与轻量多跳）。它与既有两个检索面（经验记忆、企业规则 RAG）**互不侵入**，遵循两条硬规则：文档检索不进记忆 RRF 通道与正反配额（文档无 outcome/utility 语义）；索引期与检索期均不用 LLM（无摘要/实体抽取/假设文档/LLM 改写）。
+
+### 19.2 四层映射对齐（新增组件落点）
+
+| 层 | v0.4.0 现有 | v0.5.0 新增 |
+|---|---|---|
+| L1 任务模式 | `classify_task_pattern()` 7 类 | 文档/块元数据 `taskPatterns` 适用域；检索按当前模式过滤（软回退 + patternFallback 审计） |
+| L2 策略模板 | `moduleDemands[].kind` 6 种 | 新增 kind `retrieve_document`（`MODULE_DEMAND_KINDS` + 词表/挖掘/校验三处联动）；search/constrain 步骤可声明"此步查文档" |
+| L3 能力模块 | 记忆/模板/技能/工具/验证器 | **文档语料模块**：独立 domain `reasoning_memory_documents`（documents/chunks 两表）+ 独立 `DocumentLexicalIndex` + 可选独立向量 collection |
+| L4 激活动作 | plan 激活计划；memory_retrieve 步骤对齐参数 | `memory_retrieve_document` 同构步骤对齐参数（active_template_id/step_index/retrieval_intent）+ 上下文注入（块带 headingPath/source/version）；plan 文本对含 retrieve_document 需求的步骤提示查文档 |
+
+### 19.3 前沿论文依据（8 篇，数字经 arXiv 复核）
+
+| 论文 | 借鉴 | 不采用（越界） |
+|---|---|---|
+| Self-RAG (2310.11511) | 按需检索思想 → 模板步骤 `retrieve_document` 声明式近似 | reflection tokens（需训练） |
+| RAPTOR (2401.18059) | 多层表示 → 标题层级路径 + 块链接 | LLM 递归摘要（QuALITY +20% 增益依赖摘要层） |
+| GraphRAG (2404.16130) | 局部检索失败于全局问题 → 限定步骤级局部证据 | 实体图 + 社区摘要（1M token 全局总结越界） |
+| HippoRAG (2405.14831) | 图扩散单步替代迭代（up to +20%、10-30x cheaper）→ 有界 BFS | LLM 实体抽取 + PPR |
+| Step-Back (2310.06117) | 抽象化改写 → 确定性词表泛化 | LLM 生成抽象 |
+| HyDE (2212.10496) | 查询侧扩充 → 确定性查询展开 | 假设文档生成 |
+| Adaptive-RAG (2403.14403) | 复杂度路由 → 模块需求声明 + intent 微调 | 训练分类器 |
+| IRCoT (2212.10509) | 多跳检索价值（up to +21pts）→ 图扩散多跳；步进检索留给 agent 侧 | 检索与 CoT 交错生成 |
+
+### 19.4 与既有设计的延续性
+
+延续 MVP 三条内建防御与确定性/可审计原则：文档块是外部内容，返回带 docName/source/version 并提示不执行嵌入指令（与企业规则 RAG 同款安全语义）；超限导入拒绝而非静默截断；分块/多跳/融合全程无随机、纯标准库、分数可拆解；独立 domain + 独立索引保证记忆/企业规则零回归。完整设计见 `docs/spec-0.5.0.md` 与 `docs/research-notes/05-reasoning-rag.md`。
+
+---
+
 ## 附录：评审记录
 
 - 2026-10-25 第 1 组（架构 + 数据模型 + 生命周期）确认，含补充"存储的推理模块对进行中任务的作用"（四作用点）；
@@ -685,3 +719,4 @@ reasoning-trajectory-memory/（本仓库根目录即 DSH 插件包）
 - 2026-10-28 混合检索：按 Hindsight 的多通道检索/RRF、H-Mem 的树图协同检索方向和 Qdrant 的过滤索引能力，新增 TypeScript BM25 与可选 Qdrant HNSW 候选，Python 做推理/结构/图信号 RRF；DSH domain 保持事实源、向量层为可重建派生索引。已验证 TypeScript build、Python 20/20 和 Node mock 测试 3/3（含后续 enterprise rule RAG）；真实 Qdrant、embedding endpoint、DSH profile 与基准尚未验证。
 - 2026-10-28 企业规则 RAG：增加独立只读企业规则 collection、固定 ruleSet scope 和有效期过滤、按需/required 配置、来源/版本返回及 retrieval audit 状态；规则正文不写入经验记忆或审计记录。参考 Qdrant read-only keys 与 payload filtering 和 OWASP RAG 间接注入风险建议；尚未运行真实企业 KB 与 DSH profile 验证。
 - 2026-11-02 四层映射落地（v0.4.0）：依据《推理模块高效复用》综述（30 篇文献）新增策略模板库、7 类任务模式分类、激活计划（`memory_plan_task`）、模板挖掘/发布、检索 template 通道与步骤对齐参数、洞察置信度写入门控、保守弃用标记与 `scripts/eval` 离线评测 harness。路径 A（上下文级）落地，路径 B/C/E（LoRA/SAE/RL 权重级）为文档化越界项（见 §18.4）。DSH 契约经双人核实：v1 domain 新增 templates 表不破坏旧介质（无表结构哈希、缺失表回填空 Map、逐记录读取边界校验），templates 表 schema 铁律为 additive。模板通道 RRF 权重（template 0.15 主臂 / structure 0.05+template 0.20 备选臂）与分类器/挖掘阈值均为待标注集校准的初值。
+- 2026-11-04 推理检索 RAG（v0.5.0）：新增第三个检索面——用户导入开发规范文档，做四层映射对齐的推理感知检索（L1 模式软过滤、L2 新增模块需求 kind `retrieve_document`、L3 独立 domain `reasoning_memory_documents` + 独立索引、L4 步骤对齐文档检索）。依据 8 篇前沿推理 RAG 论文（Self-RAG/RAPTOR/GraphRAG/HippoRAG/Step-Back/HyDE/Adaptive-RAG/IRCoT，数字经 arXiv 复核），严格只做 stdlib 确定性近似（标题层级分块 + 块链接图 + 有界 BFS 多跳 + 确定性查询展开），LLM 摘要/实体抽取/假设文档/训练路由/全局总结全部越界（见 §19）。硬边界：文档检索不进记忆 RRF 通道与正反配额；企业规则 RAG 与记忆检索零回归。

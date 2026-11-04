@@ -130,6 +130,16 @@ reasoning-memory:
 
 结果通过 `enterpriseRules` 单独返回，包含规则文本、来源、版本、优先级、生效时间和相关度；审计只保存规则 ID、状态和 required 标记，不复制规则正文。`enterpriseRuleRagStatus` 区分 `ready`、`no_matches`、`unavailable`、`invalid_configuration` 与 `disabled`。无命中不代表企业没有适用规则；若 profile 要求规则检索而服务不可用或未命中，结果会明确要求先核对企业规则源。检索返回的是带来源的政策片段，不是确定性合规判定；需要阻止越权工具操作时仍应在企业策略引擎或 DSH 工具执行层实施规则。规则正文作为检索数据处理：核验来源/适用范围，不执行其中要求泄露秘密或覆盖更高优先级安全指令的内容。
 
+### 推理检索 RAG（文档导入，v0.5.0）
+
+推理检索 RAG 是第三个检索面：用户导入公司开发规范等**文档**，插件做**推理感知的检索**——不只是关键词/向量召回，而是按四层映射带上任务模式、策略模板步骤意图与推理图上下文，做过滤、确定性查询展开与轻量多跳。它与经验记忆、企业规则 RAG 完全解耦：文档检索不进记忆 RRF 通道与正反配额，也不进企业规则 collection。
+
+- **导入**：`memory_import_document`（`name` 必须 `memory_doc_` 前缀、`content` ≤ 200k 字符、可选 `task_patterns`/`source`/`version`）。markdown 标题层级驱动分块（目标 1200 字符、碎片并入、无重叠窗口），自动建立 `prev/next/parent` 结构链接与 `refs` 引用链接（markdown 锚点 + `见 §x.y`/`第 X 章` 章节引用）。同名再导入 = 替换旧块 + 版本 +1。
+- **检索**：`memory_retrieve_document` 与 `memory_retrieve` 同构步骤对齐参数（`query`/`active_template_id`/`step_index`/`retrieval_intent`/`task_pattern`/`reasoning_graph_json`/`max_hops`）。内部做四件事：L1 任务模式软过滤（无命中回退 general 文档并审计 `patternFallback`）、确定性查询展开（图节点文本 + 模式词表泛化 + 模板步骤 intent，无 LLM）、有界多跳（深度 ≤2、衰减 0.6^hop）、文档域 mini-RRF 融合（lexical 0.45 / vector 0.35 / pattern 0.10 / link 0.10）。
+- **其它工具**：`memory_list_documents`（元数据清单）、`memory_load_document`（≤200 块全读，大文档提示走检索）、`memory_delete_document`（删文档及其块与双索引）。
+- **四层映射对齐**：L1 文档/块元数据带 `taskPatterns` 适用域；L2 策略模板新增模块需求 kind `retrieve_document`（search/constrain 步骤可声明"此步查文档"，`memory_plan_task` 会提示）；L3 文档语料 = 独立能力模块（独立 domain `reasoning_memory_documents` + 独立 BM25/向量索引）；L4 步骤对齐的上下文注入（返回块带 headingPath/docName/source/version）。
+- **边界**：索引期与检索期均不用 LLM（无摘要/实体抽取/假设文档/LLM 改写）；文档检索只服务步骤级局部证据，不做全局总结；文档块是外部内容，返回带来源/版本并提示不执行其中嵌入指令（与企业规则 RAG 同款安全语义）。前沿依据见设计文档 §19 与 `docs/research-notes/05-reasoning-rag.md`。
+
 ### 任务逻辑图
 
 `memory_retrieve` 可接收 `reasoning_graph_json`，`memory_save_outcome` 也可为记忆提交同样的图。v1 是带关系标签的有向无环图（DAG）：节点表示任务情境/前提、推断或失败、动作、证据、结论；边可表示 `supports`、`requires`、`leads_to`、`precedes`、`guides`、`explains`、`qualifies` 等依赖。每个节点和边带来源标签，显式输入的来源统一记为 `agent_input`，自动抽取的动作来自 `tool_trace`，验证依据来自 `verifier_input`。最多 24 个节点和 48 条边；除 `contradicts` 外的依赖关系必须无环。插件不保存或要求完整 CoT，只接收简洁、可核验的逻辑摘要。
@@ -155,6 +165,8 @@ DSH 通过 `dsh.bundle.patch` 自动将 `reasoning-memory` 插件行加入 profi
 推理捕获与蒸馏的可选配置：`captureReasoningEnabled`（默认关闭；开启后 `assistant/message` 的 reasoning 内容块与 token usage 仅暂存在内存，`memory_end_task` 汇总返回，不持久化）、`maxReasoningTextChars`（默认 4000）、`llmDistillationEnabled`、`llmDistillationTemperature`（默认 1.0）、`distillationProvider`/`distillationModel`（留空时复用本任务捕获的模型，或使用 API 配置文件的 `distillation` 端点）、`maxMemoryItemsPerOutcome`（1–3，默认 3）、`deSpecificationThreshold`（默认 0.9）、`relevanceThreshold`（默认 0）、`memoryConsolidationEnabled`、`apiConfigPath`（用户 API 端点配置文件路径，见上文）。蒸馏与整合优先走 API 配置文件的端点，其次通过 `ctx.get('llm')` 使用 DSH llm 服务；全部不可用时自动回退到调用者提交的 insight 路径。
 
 策略模板层的可选配置：`minInsightConfidence`（默认 0；>0 时低于阈值的洞察条目拒写）、`deprecatedAfterHarmfulFeedback`（默认 0；>0 时同一记忆在 ≥N 个不同任务收到 harmful 反馈后标记 deprecated，只标记不删除）、`templateMatchMin`（默认 0.55；`memory_plan_task` 注入模板的最低匹配分）。
+
+推理检索 RAG 的可选配置：`documentChunkTargetChars`（默认 1200，分块目标字符数）、`documentChunkMinChars`（默认 300，碎片并入阈值）、`documentMaxHops`（默认 2，多跳扩散深度上限）、`documentCollection`（默认 `reasoning_documents`，文档向量 collection 名）。文档向量检索默认跟随 `vectorIndexEnabled`，与记忆/企业规则三 collection 互不共享。
 
 向量检索的可选配置示例（其余 DSH profile 字段依开发文档提供）：
 
@@ -201,12 +213,15 @@ reasoning-memory:
 7. 可选：对同一类任务多次尝试得到的记忆调用 `memory_consolidate`（需 profile 开启 `memoryConsolidationEnabled` 并配置蒸馏模型），用自对比推理把成败经验对比蒸馏成更高质量条目（MaTTS 并行扩展的落点）；源记忆保留，新条目逐条标记 success/fail。
 8. 可选：把反复验证过的记忆用 `memory_publish_skill` 发布为技能（`memory_list_skills` / `memory_load_skill` / `memory_load_skill_resource` 按需消费），供本插件与外部 harness 复用。
 9. 可选：用 `memory_publish_template` 把提炼出的任务处理套路发布为策略模板（`memory_list_templates` / `memory_load_template` 按需消费），供 `memory_plan_task` 在后续任务中匹配。
+10. 可选（文档语料）：用 `memory_import_document` 导入开发规范等文档（`memory_list_documents` / `memory_load_document` 管理），在 `memory_plan_task` 提示查文档的步骤调用 `memory_retrieve_document`（步骤对齐检索），不再需要时 `memory_delete_document` 清理。
 
 `reasoning_memory` 使用 DSH JSON storage domain 的 `per-record` 布局。新增的记忆/审计字段有默认值，兼容已有 v1 记录；旧记忆若没有独立 `reasoning` 字段，Python 会从旧版 `content` 前缀尽力恢复教训用于检索。DSH storage-domain 本身不提供自动数据迁移。MVP 不实现自动逐轮注入、自动重试、LLM-as-judge、在线 bandit 或推理预算控制。完整研究取舍、局限和评测计划见 [MVP_EVALUATION.md](./MVP_EVALUATION.md)。
 
 ## 研究依据
 
-本迭代（v0.4.0）的策略模板库与激活动作化依据《面向 LLM 智能体的推理模块高效复用研究综述（终稿）》及其 30 篇已核实文献（四层映射骨架与路径 A；完整映射表与越界声明见设计文档 §18），其中关键数字已经独立复核（`docs/research-notes/03-survey-facts.md`）：Tree-of-Experience（arXiv:2608.09044）Game of 24 相对无经验 ToT 基线 +31.4%、FinEvolveBench tsIC 平均 +41.24%（12 个评测设置）；ProactAgent（arXiv:2604.20572）SciWorld/AlfWorld/StuLife 成功率相对提升 up to 32%、交互轮次减少 over 33%；MemWeaver（arXiv:2601.18204）LoCoMo 输入上下文长度相对长上下文基线压缩 over 95%；EvolveR（arXiv:2510.16079）"离线自蒸馏 → 在线交互 → 策略进化"三组件（正文 §3）与 (c_succ+1)/(c_use+2) 效用分；LoRAHub（arXiv:2307.13269）组合不引入新参数、不需梯度（CMA-ES）。
+v0.4.0 的策略模板库与激活动作化依据《面向 LLM 智能体的推理模块高效复用研究综述（终稿）》及其 30 篇已核实文献（四层映射骨架与路径 A；完整映射表与越界声明见设计文档 §18），其中关键数字已经独立复核（`docs/research-notes/03-survey-facts.md`）：Tree-of-Experience（arXiv:2608.09044）Game of 24 相对无经验 ToT 基线 +31.4%、FinEvolveBench tsIC 平均 +41.24%（12 个评测设置）；ProactAgent（arXiv:2604.20572）SciWorld/AlfWorld/StuLife 成功率相对提升 up to 32%、交互轮次减少 over 33%；MemWeaver（arXiv:2601.18204）LoCoMo 输入上下文长度相对长上下文基线压缩 over 95%；EvolveR（arXiv:2510.16079）"离线自蒸馏 → 在线交互 → 策略进化"三组件（正文 §3）与 (c_succ+1)/(c_use+2) 效用分；LoRAHub（arXiv:2307.13269）组合不引入新参数、不需梯度（CMA-ES）。
+
+v0.5.0 的推理检索 RAG 依据 8 篇前沿论文（完整映射与越界声明见设计文档 §19 与 `docs/research-notes/05-reasoning-rag.md`，数字均经 arXiv 摘要复核）：Self-RAG（arXiv:2310.11511，按需检索→模板步骤 `retrieve_document` 声明式近似）、RAPTOR（arXiv:2401.18059，多层表示→标题层级分块，QuALITY +20% 依赖 LLM 摘要层故不复制）、GraphRAG（arXiv:2404.16130，全局总结越界）、HippoRAG（arXiv:2405.14831，图扩散单步→有界 BFS 多跳）、Step-Back（arXiv:2310.06117，抽象改写→确定性词表泛化）、HyDE（arXiv:2212.10496，查询展开）、Adaptive-RAG（arXiv:2403.14403，路由→模块需求声明）、IRCoT（arXiv:2212.10509，多跳检索价值）。
 
 - Ouyang et al., [ReasoningBank: Scaling Agent Self-Evolving with Reasoning Memory](https://arxiv.org/abs/2509.25140), ICLR 2026。
 - 官方实现：[google-research/reasoning-bank](https://github.com/google-research/reasoning-bank)。该仓库提供 SWE-Bench 与 WebArena 实验代码；本插件复用其成功/失败经验蒸馏、检索、回写的核心框架思想，不复制其 benchmark harness。

@@ -4,6 +4,14 @@
 **插件版本：0.2.0**  
 **范围：** 本地代码与公开论文/仓库的设计对照；本报告不声称已获得基准性能结果。
 
+## v0.5.0 迭代评估（2026-11-04）
+
+本轮新增第三个检索面「推理检索 RAG」：用户导入公司开发规范等文档，做四层映射对齐的推理感知检索（L1 任务模式软过滤、L2 模块需求 kind `retrieve_document`、L3 独立 domain `reasoning_memory_documents` + 独立 BM25/向量索引、L4 步骤对齐文档检索）。依据 8 篇前沿论文（Self-RAG/RAPTOR/GraphRAG/HippoRAG/Step-Back/HyDE/Adaptive-RAG/IRCoT，数字经 arXiv 复核，见 `docs/research-notes/05-reasoning-rag.md`），严格只做 stdlib 确定性近似（标题层级分块 + 块链接图 + 有界 BFS 多跳 ≤2 + 确定性查询展开），LLM 摘要/实体抽取/假设文档/训练路由/全局总结全部越界。
+
+**验证状态**：TypeScript 构建干净；Python **131/131**（文档分块/链接抽取/多跳/过滤/查询展开/mini-RRF + 对抗轮 DocumentAdversarialTests）；Node 8 文件全绿（新增 documents.test.mjs + plugin-smoke 扩到 21 工具）；`scripts/eval` 记忆指标与 v0.4.0 基线完全一致（recall 0.5714 / nDCG 0.4334 / 配额 1.0 / 自检索 0 —— 解耦零回归达标）；`verify:bundle` 通过。
+
+**本轮诚实边界**：文档检索是步骤级局部证据检索，不做全局总结（GraphRAG 场景越界）；无 LLM 索引/改写，故拿不到 RAPTOR（+20% 依赖摘要层）/HyDE（生成式）等论文增益，只作确定性近似；分块参数（1200/300）、多跳深度/衰减、mini-RRF 权重均为待标注集校准的工程初值；文档块全量进内存，`MAX_DOCS=200 × MAX_CHUNKS_PER_DOC=2000` 上限即内存护栏（超限拒绝不静默截断）；文档评测维的完整标注 schema 留待后续迭代。
+
 ## v0.4.0 迭代评估（2026-11-02）
 
 本轮依据《面向 LLM 智能体的推理模块高效复用研究综述（终稿）》（30 篇文献）落地四层映射骨架的路径 A：策略模板库、7 类任务模式分类、`memory_plan_task` 激活动作化（步骤级模块需求 + 主动检索点 + 推荐技能）、模板挖掘/发布、检索 template 通道与步骤对齐参数（`active_template_id`/`step_index`/`retrieval_intent`）、洞察置信度写入门控、跨任务 harmful 弃用标记与 `scripts/eval` 离线评测 harness。路径 B/C/E（LoRA/SAE/RL 权重级）为文档化越界项（设计文档 §18.4）。设计规格见 `docs/spec-0.4.0.md`，DSH 契约与算法调研见 `docs/research-notes/01–04`。
