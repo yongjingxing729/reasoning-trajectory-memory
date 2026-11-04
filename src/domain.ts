@@ -96,6 +96,7 @@ export const templateModuleDemandSchema = z.object({
     'invoke_tool',
     'verify',
     'rollback_check',
+    'retrieve_document',
   ]),
   intent: z.string().default(''),
 })
@@ -163,7 +164,7 @@ export const retrievalRecordSchema = z.object({
   taskId: z.string(),
   sourceSessionId: z.string(),
   queryHash: z.string(),
-  route: z.enum(['auto', 'semantic', 'structure', 'graph', 'hybrid']),
+  route: z.enum(['auto', 'semantic', 'structure', 'graph', 'hybrid', 'document']),
   requestedK: z.number().int().positive(),
   positiveNegativeRatio: z.number().positive(),
   // v0.4.0 step-aligned retrieval audit. All additive with defaults.
@@ -172,6 +173,10 @@ export const retrievalRecordSchema = z.object({
   retrievalIntent: z.string().default(''),
   templateChannelWeight: z.number().min(0).max(1).default(0),
   deprecatedFilteredCount: z.number().int().nonnegative().default(0),
+  // v0.5.0 document retrieval audit: document results live in their own
+  // fields and never enter selectedMemoryIds or the memory quota.
+  documentIds: z.array(z.string()).default([]),
+  documentPatternFallback: z.boolean().default(false),
   fusionWeights: z.object({
     // Defaults admit legacy v1 audits written with { semantic, structure }.
     context: z.number().min(0).max(1).default(0.45),
