@@ -6,6 +6,8 @@ from typing import Any
 
 from .constants import TEMPLATE_MATCH_MIN
 from .distillation import _make_memory
+from .doc_chunking import chunk_document
+from .doc_rag import delete_document_plan, retrieve_document
 from .feedback import _record_feedback
 from .retrieval import _retrieve
 from .templates import (
@@ -61,4 +63,42 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any]:
         return publish_template_validate(draft)
     if operation == "builtin_templates":
         return {"templates": builtin_template_records()}
+    if operation == "import_document":
+        result = chunk_document(
+            doc_id=str(request.get("docId", "")),
+            content=str(request.get("content", "")),
+            chunk_target=request.get("chunkTargetChars", 1200),
+            chunk_min=request.get("chunkMinChars", 300),
+        )
+        return {
+            "docId": request.get("docId", ""),
+            "name": str(request.get("name", "")),
+            "charCount": result["charCount"],
+            "chunkCount": result["chunkCount"],
+            "chunks": result["chunks"],
+            "audit": result["audit"],
+        }
+    if operation == "retrieve_document":
+        return retrieve_document(
+            query=str(request.get("query", "")),
+            reasoning_graph_json=str(request.get("reasoningGraphJson", "")),
+            chunks=_as_list(request, "chunks"),
+            documents=_as_list(request, "documents"),
+            task_pattern=str(request.get("taskPattern", "")),
+            task_family=str(request.get("taskFamily", "")),
+            active_template_id=str(request.get("activeTemplateId", "")),
+            active_template=request.get("activeTemplate") if isinstance(request.get("activeTemplate"), dict) else None,
+            step_index=request.get("stepIndex", 0),
+            retrieval_intent=str(request.get("retrievalIntent", "")),
+            max_hops=request.get("maxHops", 2),
+            k=request.get("k", 4),
+            pseudo_feedback=bool(request.get("pseudoFeedback", False)),
+            lexical_scores=request.get("lexicalScores") if isinstance(request.get("lexicalScores"), dict) else None,
+            vector_scores=request.get("vectorScores") if isinstance(request.get("vectorScores"), dict) else None,
+        )
+    if operation == "delete_document_plan":
+        return delete_document_plan(
+            doc_id=str(request.get("docId", "")),
+            chunks=_as_list(request, "chunks"),
+        )
     raise ValueError(f"unsupported operation: {operation}")

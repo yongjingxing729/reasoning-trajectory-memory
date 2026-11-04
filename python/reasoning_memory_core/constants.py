@@ -11,7 +11,7 @@ TAG_TEXT = {
     "rollback": "根据失败结果回退或修正",
 }
 
-EXTRACTOR_VERSION = "dsh-reasoning-memory/0.4.0"
+EXTRACTOR_VERSION = "dsh-reasoning-memory/0.5.0"
 
 MAX_CAPTURED_EVENTS = 2000
 
@@ -73,6 +73,7 @@ MODULE_DEMAND_KINDS = (
     "invoke_tool",
     "verify",
     "rollback_check",
+    "retrieve_document",
 )
 
 # StrategyTemplate record caps (mirror the limits in the final v0.4.0 spec).
@@ -201,8 +202,8 @@ PATTERN_KEYWORDS = {
 # come first; optional kinds follow.
 MODULE_DEMAND_BY_TAG = {
     "decompose": (("retrieve_template",), ("retrieve_memory",)),
-    "constrain": ((), ("retrieve_memory",)),
-    "search": (("retrieve_memory",), ("invoke_tool",)),
+    "constrain": ((), ("retrieve_memory", "retrieve_document")),
+    "search": (("retrieve_memory", "retrieve_document"), ("invoke_tool",)),
     "execute": (("invoke_tool",), ("use_skill",)),
     "verify": (("verify",), ()),
     "rollback": (("rollback_check",), ("verify",)),
@@ -217,6 +218,7 @@ MODULE_DEMAND_TAG = {
     "invoke_tool": "execute",
     "verify": "verify",
     "rollback_check": "rollback",
+    "retrieve_document": "search",
 }
 
 # Deterministic intent text for generated module demands (retrieval query
@@ -228,6 +230,7 @@ MODULE_DEMAND_INTENT = {
     "invoke_tool": "调用执行本步骤所需的 DSH 工具",
     "verify": "用测试、环境或数值验证器核验本步骤结果",
     "rollback_check": "回退前先检索失败教训，确认归因后再改变路径",
+    "retrieve_document": "检索用户导入的开发规范/文档，按步骤意图过滤",
 }
 
 # Template-channel fusion weights (final spec 3.4). The RRF row applies while
@@ -298,3 +301,59 @@ BUILTIN_TEMPLATES = (
         "taskPatterns": ("tool_orchestration", "code_synthesis"),
     },
 )
+
+# ---------------------------------------------------------------------------
+# v0.5.0 reasoning-aware document retrieval (final spec 0.5.0). Documents are
+# an independent retrieval surface: they never enter the memory RRF channels
+# or the positive/negative quota. All values are engineering initial values.
+# ---------------------------------------------------------------------------
+
+MAX_DOCS = 200
+
+MAX_DOC_CONTENT_CHARS = 200_000
+
+MAX_CHUNKS_PER_DOC = 2000
+
+MAX_CHUNK_TEXT_CHARS = 2000
+
+MAX_DOC_NAME_CHARS = 80
+
+MAX_DOC_TASK_PATTERNS = 7
+
+MAX_CHUNK_REFS = 20
+
+CHUNK_TARGET_CHARS = 1200
+
+CHUNK_MIN_CHARS = 300
+
+DOC_QUERY_DEFAULT_K = 4
+
+DOC_QUERY_MAX_K = 10
+
+DOC_MAX_HOPS = 2
+
+DOC_HOP_DECAY = 0.6
+
+DOC_EXPAND_CAP = 16
+
+# Document-domain mini-RRF channel weights (final spec 3.2). RRF is used only
+# when both lexical and vector channels have ranked candidates; otherwise the
+# same weights drive a normalized weighted sum over the active channels.
+DOC_RRF_WEIGHTS = {
+    "lexical": 0.45,
+    "vector": 0.35,
+    "pattern": 0.10,
+    "link": 0.10,
+}
+
+# Step-intent micro adjustments for the document-domain fusion.
+DOC_INTENT_WEIGHT_DELTAS = {
+    "constrain": {"pattern": 0.05},
+}
+
+# Default load cap for memory_load_document (chunks per call).
+DOC_LOAD_DEFAULT_LIMIT = 50
+
+DOC_LOAD_MAX_LIMIT = 200
+
+DOC_LOAD_FULL_READ_THRESHOLD = 200

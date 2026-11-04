@@ -21,6 +21,8 @@ import sys
 from reasoning_memory_core import handle_request
 from reasoning_memory_core.constants import *  # noqa: F403
 from reasoning_memory_core.distillation import _make_memory
+from reasoning_memory_core.doc_chunking import chunk_document
+from reasoning_memory_core.doc_rag import delete_document_plan, retrieve_document
 from reasoning_memory_core.feedback import _record_feedback
 from reasoning_memory_core.reasoning_graph import (
     _fallback_reasoning_graph,
