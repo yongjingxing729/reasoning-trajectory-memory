@@ -22,6 +22,11 @@ import {
   type DocumentChunk,
   type DocumentRecord,
 } from './document-domain.js'
+import {
+  causalEventSchema,
+  reasoningMemoryCausalDomain,
+  type CausalEvent,
+} from './causal-domain.js'
 import { DocumentLexicalIndex } from './document-index.js'
 import { QdrantDocumentIndex } from './document-vector.js'
 import { checkPythonVersion, runReasoningCore } from './python.js'
@@ -190,6 +195,8 @@ type ActiveTask = {
   feedbackMemoryIds: Set<string>
   planTemplateIds: Set<string>
   templateFeedbackRecorded: Set<string>
+  causalEventsRecorded: boolean
+  counterfactualRecorded: Set<string>
   reasoningText: string
   reasoningCaptureStatus: 'disabled' | 'provided' | 'not-provided'
   capturedModel: { provider: string; model: string } | null
@@ -240,6 +247,12 @@ type RetrievalResponse = {
     vectorRank: number | null
     combinedRank: number
     selectedRank: number | null
+    causalApplied: boolean
+    causalUplift: number
+    causalSamples: number
+    simpsonParadox: boolean
+    causalStrata: string
+    estimatorVersion: string
   }>
   queryHash: string
   balance: {
@@ -253,6 +266,7 @@ type RetrievalResponse = {
   fusionMode: 'weighted' | 'rrf'
   templateChannelWeight?: number
   deprecatedFilteredCount?: number
+  simpsonNote?: string
   reason: string
 }
 
@@ -348,6 +362,39 @@ type DocumentImportResponse = {
 type DocumentDeletePlanResponse = {
   docId: string
   chunkIds: string[]
+}
+
+type CausalEstimateResponse = {
+  causalApplied: boolean
+  causalMultiplier: number
+  ate: number
+  ateVariance: number
+  se: number
+  ciLower: number
+  ciUpper: number
+  ateShrunk: number
+  crude: number
+  crudeSe: number
+  simpsonFlip: boolean
+  iptwAte: number
+  iptwDisagreement: boolean
+  pairedAte: number
+  pairedPairs: number
+  nEff: number
+  nTreated: number
+  nControl: number
+  cate: Array<{ stratum: string; n1: number; n0: number; y1: number; y0: number; cate: number }>
+  droppedStrata: string[]
+  estimatorVersion: string
+  reason: string
+}
+
+type ClassifyResponse = {
+  pattern: TaskPattern
+  confidence: number
+  evidence: Array<{ signal: string; hit: JsonValue; weight: number }>
+  scores: Record<string, number>
+  fallback: boolean
 }
 
 const REASONING_GRAPH_SCHEMA = {
@@ -567,6 +614,16 @@ const MEMORY_QUERY_OUTPUT_SCHEMA = {
           reasoningLevel: { type: 'string', required: true },
           insightConfidence: { type: 'number', required: true },
           status: { type: 'string', required: true },
+          causal: {
+            type: 'object', required: true, additionalProperties: false,
+            properties: {
+              applied: { type: 'boolean', required: true },
+              ate: { type: 'number', required: true },
+              nEff: { type: 'integer', required: true },
+              simpsonParadox: { type: 'boolean', required: true },
+              estimatorVersion: { type: 'string', required: true },
+            },
+          },
         },
       },
     },
@@ -1052,6 +1109,29 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     documentLexicalIndex.upsert(record.name, record.taskPatterns, chunk)
   }
 
+  // Causal event log for the v0.6.0 causal utility engine: its own domain,
+  // written by memory_save_outcome (observational events) and
+  // memory_record_counterfactual (paired arms). The estimator runs in the
+  // Python core; this layer only records and forwards.
+  const causalDomain = await ctx.storageDomain.open(reasoningMemoryCausalDomain)
+  const causalEvents = causalDomain.table('causal_events')
+  const MAX_CAUSAL_EVENTS_PER_UNIT = 200
+  const MAX_CAUSAL_EVENTS_PER_TASK = 100
+  const writeCausalEvents = async (events: CausalEvent[]): Promise<void> => {
+    for (const event of events) await causalEvents.put(event.eventId, event)
+    // FIFO guard per unit: drop the oldest events past the cap.
+    for (const unitId of new Set(events.map(event => event.memoryId))) {
+      const unitEvents = [...causalEvents.entries()]
+        .map(([, event]) => event)
+        .filter(event => event.memoryId === unitId)
+        .sort((left, right) => left.createdAt - right.createdAt || left.eventId.localeCompare(right.eventId))
+      const overflow = unitEvents.length - MAX_CAUSAL_EVENTS_PER_UNIT
+      for (const event of unitEvents.slice(0, overflow)) {
+        await causalEvents.delete(event.eventId)
+      }
+    }
+  }
+
   // Startup environment gate: the Python core needs 3.10+; an incompatible or
   // missing interpreter surfaces here as a readable error before any bridge
   // call fails later with an opaque spawn failure.
@@ -1363,6 +1443,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     domain.close()
     skillsDomain.close()
     documentsDomain.close()
+    causalDomain.close()
     apiConfig?.stop()
     // Awaitable shutdown: hosts that honor disposer promises get a clean
     // PGlite teardown; hosts that ignore them keep the fire-and-forget path.
@@ -1502,6 +1583,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         feedbackMemoryIds: new Set(),
         planTemplateIds: new Set(),
         templateFeedbackRecorded: new Set(),
+        causalEventsRecorded: false,
+        counterfactualRecorded: new Set(),
         reasoningText: '',
         reasoningCaptureStatus: config.captureReasoningEnabled ? 'not-provided' : 'disabled',
         capturedModel: null,
@@ -1681,6 +1764,17 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const includeDeprecated = args.include_deprecated !== false
       const intentIgnored = typeof args.retrieval_intent === 'string' && !retrievalIntent
 
+      // v0.6.0 causal utility: forward each candidate's causal event history
+      // to the Python core, which computes the stratified estimate and may
+      // replace the Beta utility multiplier (bounded, quota untouched).
+      const causalEventsByMemory: Record<string, CausalEvent[]> = {}
+      if (causalEvents.size > 0) {
+        for (const [, event] of causalEvents.entries()) {
+          const bucket = causalEventsByMemory[event.memoryId] ??= []
+          if (bucket.length < 200) bucket.push(event)
+        }
+      }
+
       const reasoningResultPromise = runReasoningCore<RetrievalResponse>(config.pythonExecutable!, {
         operation: 'retrieve',
         query,
@@ -1693,6 +1787,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         stepIndex,
         retrievalIntent,
         includeDeprecated,
+        causalEventsByMemory,
         k: requestedK,
         route,
         positiveNegativeRatio: config.positiveNegativeRatio,
@@ -1752,6 +1847,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       // positive/negative quota selection when include_deprecated is false,
       // so the returned rows and the balance counts always agree.
       const retrievalId = randomUUID()
+      const topSelectedCandidate = result.candidateScores.find(candidate => candidate.selectedRank === 1)
       const audit = retrievalRecordSchema.parse({
         retrievalId,
         taskId: active?.taskId ?? '',
@@ -1765,6 +1861,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         retrievalIntent,
         templateChannelWeight: result.templateChannelWeight ?? 0,
         deprecatedFilteredCount: result.deprecatedFilteredCount ?? 0,
+        causalUplift: topSelectedCandidate?.causalUplift ?? 0,
+        causalSamples: topSelectedCandidate?.causalSamples ?? 0,
+        simpsonParadox: topSelectedCandidate?.simpsonParadox ?? false,
+        causalStrata: topSelectedCandidate?.causalStrata ?? '',
+        estimatorVersion: topSelectedCandidate?.estimatorVersion ?? '',
         relevanceThreshold: config.relevanceThreshold,
         thresholdFilteredCount: result.balance.thresholdFilteredCount,
         fusionWeights: result.fusionWeights,
@@ -1802,6 +1903,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           activeTemplateId && !activeTemplate ? 'The requested active_template_id does not exist in the template bank; retrieval ran without a template channel.' : '',
           intentIgnored ? 'The retrieval_intent value was not a module-demand kind and was ignored.' : '',
           (result.deprecatedFilteredCount ?? 0) > 0 ? `${result.deprecatedFilteredCount} deprecated memories were excluded before quota selection because include_deprecated was false.` : '',
+          result.simpsonNote ?? '',
           result.reason,
           result.balance.fallbackUsed
             ? 'The requested positive:negative ratio could not be fully met; available outcomes filled the remaining slots.'
@@ -2091,6 +2193,47 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         maxItemsPerOutcome: config.maxMemoryItemsPerOutcome,
         deSpecificationThreshold: config.deSpecificationThreshold,
       }, exec.signal)
+
+      // v0.6.0 observational causal events: one record per memory retrieved
+      // in this task, with the treatment defined by whether feedback marked
+      // it used. Written once per task, only for success/fail outcomes; the
+      // Beta feedback semantics stay untouched (zero regression).
+      if (outcome === 'success' || outcome === 'fail') {
+        if (!active.causalEventsRecorded) {
+          active.causalEventsRecorded = true
+          try {
+            const classification = await runReasoningCore<ClassifyResponse>(config.pythonExecutable!, {
+              operation: 'classify_task_pattern',
+              taskDesc: active.semanticText,
+              taskFamily: active.taskFamily,
+              events: active.events,
+            }, exec.signal)
+            const now = Date.now()
+            const pattern = classification.pattern
+            const events: CausalEvent[] = [...active.retrievedMemoryIds]
+              .slice(0, MAX_CAUSAL_EVENTS_PER_TASK)
+              .map(memoryId => causalEventSchema.parse({
+                eventId: `${memoryId}:${active.taskId}:${now}`,
+                memoryId,
+                kind: 'memory' as const,
+                taskId: active.taskId,
+                taskPattern: pattern,
+                treatment: active.feedbackMemoryIds.has(memoryId) ? 'used' : 'retrieved_unused',
+                outcome,
+                stepIndex: 0,
+                retrievalIntent: '',
+                modelVersion: active.capturedModel?.model ?? '',
+                pairId: '',
+                createdAt: now,
+              }))
+            await writeCausalEvents(events)
+          } catch (error) {
+            // Causal recording is best effort: a classification failure must
+            // never block the outcome save.
+            ctx.logger.warn(`reasoning-memory: causal event derivation failed: ${error instanceof Error ? error.message : String(error)}`)
+          }
+        }
+      }
       if (!result.stored || !result.memories || result.memories.length === 0) {
         return {
           stored: false,
@@ -2141,6 +2284,95 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         gateRejectedCount: result.gateRejectedCount ?? 0,
         distillation: { method: extractionMethod, model: distillationModel },
       }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'memory_record_counterfactual',
+    description: 'Record one arm of a paired continuation experiment (the strongest causal evidence): run the SAME task prefix twice, once with this memory retrieved and once without, then report each arm. Both arms with the same pair_id form a pair; the causal estimator computes the paired effect from complete pairs. Each task can record at most one with-arm and one without-arm per memory. Without an active task, pair_id is required so unrelated standalone arms never pair up.',
+    parameters: {
+      memory_id: { type: 'string', required: true, description: 'The memory id whose effect is being measured.' },
+      arm: { type: 'string', required: true, enum: ['with', 'without'], description: 'Whether this continuation arm used the memory (with) or skipped it (without).' },
+      outcome: { type: 'string', required: true, enum: ['success', 'fail'], description: 'The environment/verifier outcome of this arm.' },
+      pair_id: { type: 'string', description: 'Pair identifier shared by the two arms; defaults to one pair per task and memory inside an active task, and is REQUIRED when no active task exists.' },
+      task_pattern: { type: 'string', enum: ['multi_hop_qa', 'code_synthesis', 'tool_orchestration', 'gui_operation', 'long_horizon_planning', 'numeric_search', 'general'], description: 'Stratification label for this experiment; defaults to the classified active task pattern.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          recorded: { type: 'boolean', required: true },
+          eventId: { type: 'string', required: true },
+          pairId: { type: 'string', required: true },
+          note: { type: 'string', required: true },
+        },
+      } as const,
+      render: renderJson,
+    },
+    async execute(args, exec) {
+      const sessionId = getSessionIdFromAgent(exec.agent) ?? ''
+      const active = activeBySession.get(sessionId)
+      const memory = memories.get(args.memory_id)
+      if (!memory) {
+        return { recorded: false, eventId: '', pairId: '', note: `no memory with id '${args.memory_id}'` }
+      }
+      const arm = args.arm as 'with' | 'without'
+      const explicitPair = typeof args.pair_id === 'string' && args.pair_id.trim()
+        ? clipText(args.pair_id, 100)
+        : ''
+      // Standalone arms (no active task) must declare their pair explicitly:
+      // the task-scoped default pair cannot exist here, and a global default
+      // would silently pair unrelated experiments and poison the paired ATE.
+      if (!active && !explicitPair) {
+        return {
+          recorded: false, eventId: '', pairId: '',
+          note: 'standalone counterfactual arms require an explicit pair_id; without an active task the two arms of the same pair share that id.',
+        }
+      }
+      const pairId = explicitPair || `${active!.taskId}:${memory.memoryId}`
+      if (active && active.counterfactualRecorded.has(`${pairId}|${arm}`)) {
+        return { recorded: false, eventId: '', pairId, note: 'this task already recorded this arm for this pair; each pair accepts one with-arm and one without-arm.' }
+      }
+      let pattern = args.task_pattern as CausalEvent['taskPattern'] | undefined
+      if (!pattern) {
+        try {
+          const classification = await runReasoningCore<ClassifyResponse>(config.pythonExecutable!, {
+            operation: 'classify_task_pattern',
+            taskDesc: active?.semanticText ?? memory.semanticText,
+            taskFamily: active?.taskFamily ?? '',
+            events: active?.events ?? [],
+          }, exec.signal)
+          pattern = classification.pattern
+        } catch {
+          pattern = 'general'
+        }
+      }
+      const now = Date.now()
+      const event = causalEventSchema.parse({
+        eventId: `${memory.memoryId}:${pairId}:${arm}:${now}`,
+        memoryId: memory.memoryId,
+        kind: 'memory' as const,
+        taskId: active?.taskId ?? '',
+        taskPattern: pattern,
+        treatment: arm === 'with' ? 'counterfactual_with' : 'counterfactual_without',
+        outcome: args.outcome as 'success' | 'fail',
+        stepIndex: 0,
+        retrievalIntent: '',
+        modelVersion: active?.capturedModel?.model ?? '',
+        pairId,
+        createdAt: now,
+      })
+      await writeCausalEvents([event])
+      active?.counterfactualRecorded.add(`${pairId}|${arm}`)
+      const pairedArms = [...causalEvents.entries()]
+        .map(([, entry]) => entry)
+        .filter(entry => entry.pairId === pairId && entry.memoryId === memory.memoryId)
+        .map(entry => entry.treatment)
+      const note = pairedArms.includes('counterfactual_with') && pairedArms.includes('counterfactual_without')
+        ? 'Both arms are recorded: the pair now feeds the paired causal estimate.'
+        : 'Arm recorded; record the opposite arm with the same pair_id to complete the pair.'
+      return { recorded: true, eventId: event.eventId, pairId, note }
     },
   }))
 
@@ -2291,9 +2523,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       offset: { type: 'integer', description: 'Skip this many rows (default 0).' },
       sort_by: { type: 'string', enum: ['created_at', 'updated_at', 'confidence'], description: 'Sort field (default created_at).' },
       sort_order: { type: 'string', enum: ['asc', 'desc'], description: 'Sort direction (default desc).' },
+      include_causal: { type: 'boolean', description: 'Attach each row a causal utility summary (stratified ATE, effective samples, Simpson flag, estimator version). Defaults to false.' },
     },
     output: { schema: MEMORY_QUERY_OUTPUT_SCHEMA, render: renderJson },
-    async execute(args) {
+    async execute(args, exec) {
       const filter: StructuredQueryFilter = {
         outcome: args.outcome as StructuredQueryFilter['outcome'],
         type: args.type as StructuredQueryFilter['type'],
@@ -2339,7 +2572,38 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         items = scanMemories(filter)
         note = 'The built-in store is disabled in this profile; rows were scanned from the canonical memory store.'
       }
-      return { count: items.length, items, note }
+      let causalByMemory: Record<string, CausalEstimateResponse> = {}
+      if (args.include_causal === true && items.length > 0) {
+        const eventsByMemory: Record<string, CausalEvent[]> = {}
+        for (const [, event] of causalEvents.entries()) {
+          const bucket = eventsByMemory[event.memoryId] ??= []
+          if (bucket.length < 200) bucket.push(event)
+        }
+        try {
+          const result = await runReasoningCore<{ estimates: Record<string, CausalEstimateResponse> }>(
+            config.pythonExecutable!, { operation: 'causal_estimate', eventsByMemory }, exec.signal,
+          )
+          causalByMemory = result.estimates
+        } catch {
+          note += ' The causal summaries failed to compute; zero values are shown.'
+        }
+      }
+      const rows = items.map(item => {
+        const estimate = causalByMemory[item.memoryId]
+        return {
+          ...item,
+          causal: estimate
+            ? {
+                applied: estimate.causalApplied,
+                ate: estimate.ate,
+                nEff: estimate.nEff,
+                simpsonParadox: estimate.simpsonFlip,
+                estimatorVersion: estimate.estimatorVersion,
+              }
+            : { applied: false, ate: 0, nEff: 0, simpsonParadox: false, estimatorVersion: '' },
+        }
+      })
+      return { count: rows.length, items: rows, note }
     },
   }))
 
@@ -3026,7 +3290,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         provenance: { sourceMemoryIds: ids, sourceSessionId: sessionId, publishedAt: now },
         version,
         trustLevel: 'unverified' as const,
-        extractorVersion: 'dsh-reasoning-memory/0.5.0',
+        extractorVersion: 'dsh-reasoning-memory/0.6.0',
         createdAt: existing?.createdAt ?? now,
         updatedAt: now,
       })

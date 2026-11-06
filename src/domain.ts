@@ -157,6 +157,13 @@ const retrievalCandidateSchema = z.object({
   vectorRank: z.number().int().positive().nullable().default(null),
   combinedRank: z.number().int().positive(),
   selectedRank: z.number().int().positive().nullable(),
+  // v0.6.0 causal utility audit per candidate. All additive with defaults.
+  causalApplied: z.boolean().default(false),
+  causalUplift: z.number().min(-1).max(1).default(0),
+  causalSamples: z.number().int().nonnegative().default(0),
+  simpsonParadox: z.boolean().default(false),
+  causalStrata: z.string().default(''),
+  estimatorVersion: z.string().default(''),
 })
 
 export const retrievalRecordSchema = z.object({
@@ -177,6 +184,12 @@ export const retrievalRecordSchema = z.object({
   // fields and never enter selectedMemoryIds or the memory quota.
   documentIds: z.array(z.string()).default([]),
   documentPatternFallback: z.boolean().default(false),
+  // v0.6.0 causal utility audit (record-level summary of the selected rows).
+  causalUplift: z.number().min(-1).max(1).default(0),
+  causalSamples: z.number().int().nonnegative().default(0),
+  simpsonParadox: z.boolean().default(false),
+  causalStrata: z.string().default(''),
+  estimatorVersion: z.string().default(''),
   fusionWeights: z.object({
     // Defaults admit legacy v1 audits written with { semantic, structure }.
     context: z.number().min(0).max(1).default(0.45),
