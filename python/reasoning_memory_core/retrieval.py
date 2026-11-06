@@ -6,6 +6,7 @@ import hashlib
 import math
 from typing import Any
 
+from .causal_utils import causal_estimate
 from .constants import (
     MODULE_DEMAND_KINDS,
     RETRIEVAL_INTENT_WEIGHT_DELTAS,
@@ -147,6 +148,15 @@ def _retrieve(request: dict[str, Any]) -> dict[str, Any]:
             if isinstance(value, (int, float)) and math.isfinite(value):
                 overrides[key] = max(0.0, min(1.0, float(value)))
 
+    # v0.6.0 causal utility inputs (optional and additive): per-memory causal
+    # event histories computed into per-candidate estimates inside the loop.
+    causal_events_by_memory: dict[str, list[dict[str, Any]]] = {}
+    raw_causal = request.get("causalEventsByMemory")
+    if isinstance(raw_causal, dict):
+        for memory_id, events in raw_causal.items():
+            if isinstance(events, list):
+                causal_events_by_memory[str(memory_id)] = events
+
     has_sparse_candidates = any(
         isinstance(item, dict) and _rank_score(item, "lexicalScore") > 0.0
         for item in memories
@@ -265,6 +275,18 @@ def _retrieve(request: dict[str, Any]) -> dict[str, Any]:
         # usefulness helpful but never an authority over evidence or relevance.
         utility_mean = (helpful + 1.0) / (helpful + harmful + 2.0)
         utility_multiplier = 0.8 + 0.4 * utility_mean
+        # v0.6.0 causal utility: a stratified causal estimate may REPLACE the
+        # Beta multiplier (bounded to the same [0.8, 1.2] band). It never
+        # touches the RRF channel weights or the outcome quota. When the
+        # estimate does not meet the sample gates, the Beta fallback above
+        # stays in place verbatim (zero regression).
+        causal_estimate_result = None
+        memory_id = str(item.get("memoryId", ""))
+        causal_events = causal_events_by_memory.get(memory_id)
+        if isinstance(causal_events, list) and causal_events:
+            causal_estimate_result = causal_estimate(events=causal_events)
+            if causal_estimate_result["causalApplied"]:
+                utility_multiplier = causal_estimate_result["causalMultiplier"]
         combined = (
             fusion_weights["context"] * context_score
             + fusion_weights["reasoning"] * reasoning_score
@@ -282,7 +304,7 @@ def _retrieve(request: dict[str, Any]) -> dict[str, Any]:
         retrieval_item["reasoningGraph"] = memory_graph
         ranked.append({
             "item": retrieval_item,
-            "memoryId": str(item.get("memoryId", "")),
+            "memoryId": memory_id,
             "outcome": item["outcome"],
             "contextScore": round(context_score, 6),
             "reasoningScore": round(reasoning_score, 6),
@@ -295,6 +317,14 @@ def _retrieve(request: dict[str, Any]) -> dict[str, Any]:
             "deprecated": deprecated,
             "combinedScore": round(combined, 6),
             "utilityMultiplier": round(utility_multiplier, 6),
+            "causalApplied": causal_estimate_result["causalApplied"] if causal_estimate_result else False,
+            "causalUplift": causal_estimate_result["ateShrunk"] if causal_estimate_result else 0.0,
+            "causalSamples": causal_estimate_result["nEff"] if causal_estimate_result else 0,
+            "simpsonParadox": causal_estimate_result["simpsonFlip"] if causal_estimate_result else False,
+            "causalStrata": ",".join(
+                stratum["stratum"] for stratum in (causal_estimate_result["cate"] if causal_estimate_result else [])
+            ),
+            "estimatorVersion": causal_estimate_result["estimatorVersion"] if causal_estimate_result else "",
         })
 
     if fusion_mode == "rrf":
@@ -369,6 +399,8 @@ def _retrieve(request: dict[str, Any]) -> dict[str, Any]:
                 "memoryId", "outcome", "contextScore", "reasoningScore",
                 "semanticScore", "structureScore", "graphScore", "lexicalScore", "vectorScore",
                 "templateScore", "combinedScore", "utilityMultiplier",
+                "causalApplied", "causalUplift", "causalSamples", "simpsonParadox",
+                "causalStrata", "estimatorVersion",
             )
         }
     candidate_scores = []
@@ -387,6 +419,13 @@ def _retrieve(request: dict[str, Any]) -> dict[str, Any]:
 
     positive_count = sum(row["outcome"] == "success" for row in selected)
     negative_count = sum(row["outcome"] == "fail" for row in selected)
+    simpson_note = ""
+    if any(row.get("simpsonParadox") for row in selected):
+        simpson_note = (
+            "at least one selected memory shows a Simpson paradox: its overall "
+            "utility sign differs from its per-task-pattern utility sign; read "
+            "its utility by the current task pattern"
+        )
     threshold_note = ""
     if threshold > 0.0 and threshold_filtered_count > 0:
         if not selected:
@@ -407,6 +446,7 @@ def _retrieve(request: dict[str, Any]) -> dict[str, Any]:
         "fusionWeights": fusion_weights,
         "fusionMode": fusion_mode,
         "templateChannelWeight": fusion_weights.get("template", 0.0),
+        "simpsonNote": simpson_note,
         "deprecatedFilteredCount": deprecated_filtered_count,
         "reason": (
             threshold_note if threshold_note

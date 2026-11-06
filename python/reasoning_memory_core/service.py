@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .causal_utils import batch_causal_estimates, causal_estimate
 from .constants import TEMPLATE_MATCH_MIN
 from .distillation import _make_memory
 from .doc_chunking import chunk_document
@@ -13,10 +14,12 @@ from .retrieval import _retrieve
 from .templates import (
     apply_template_feedback,
     builtin_template_records,
+    classify_task_pattern,
     mine_templates,
     plan_task,
     publish_template_validate,
 )
+from .trajectory import structure_signature
 
 
 def _as_list(request: dict[str, Any], key: str) -> list[Any]:
@@ -32,6 +35,28 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any]:
         return _retrieve(request)
     if operation == "feedback":
         return _record_feedback(request)
+    if operation == "causal_estimate":
+        raw_events = request.get("events")
+        if isinstance(raw_events, list):
+            return causal_estimate(events=raw_events)
+        raw_by_unit = request.get("eventsByMemory")
+        if isinstance(raw_by_unit, dict):
+            return batch_causal_estimates(events_by_unit={
+                str(unit): events if isinstance(events, list) else []
+                for unit, events in raw_by_unit.items()
+            })
+        raise ValueError("causal_estimate requires an events list or an eventsByMemory object")
+    if operation == "classify_task_pattern":
+        raw_signature = _as_list(request, "structureSignature")
+        signature = raw_signature or structure_signature(_as_list(request, "events"))
+        return classify_task_pattern(
+            task_desc=str(request.get("taskDesc", "")),
+            goal=str(request.get("goal", "")),
+            task_family=str(request.get("taskFamily", "")),
+            structure_signature=signature or None,
+            has_graph=bool(request.get("hasGraph")),
+            graph_node_kinds=_as_list(request, "graphNodeKinds") or None,
+        )
     if operation == "plan_task":
         return plan_task(
             task_desc=str(request.get("taskDesc", "")),

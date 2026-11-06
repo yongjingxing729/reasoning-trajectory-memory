@@ -11,7 +11,7 @@ TAG_TEXT = {
     "rollback": "根据失败结果回退或修正",
 }
 
-EXTRACTOR_VERSION = "dsh-reasoning-memory/0.5.0"
+EXTRACTOR_VERSION = "dsh-reasoning-memory/0.6.0"
 
 MAX_CAPTURED_EVENTS = 2000
 
@@ -357,3 +357,41 @@ DOC_LOAD_DEFAULT_LIMIT = 50
 DOC_LOAD_MAX_LIMIT = 200
 
 DOC_LOAD_FULL_READ_THRESHOLD = 200
+
+# ---------------------------------------------------------------------------
+# v0.6.0 causal utility engine (final spec 0.6.0). Pure integer counting plus
+# deterministic arithmetic: no LLM, no structure discovery, no gradients.
+# The causal multiplier only touches the final utility multiplier; it never
+# enters the RRF channel weights or the positive/negative quota.
+# ---------------------------------------------------------------------------
+
+CAUSAL_ESTIMATOR_VERSION = "dsh-reasoning-memory/causal-1"
+
+CAUSAL_TREATMENTS = {"used", "counterfactual_with"}
+
+CAUSAL_CONTROLS = {"retrieved_unused", "counterfactual_without"}
+
+# Strata need at least this many samples in EACH arm to enter the estimate.
+MIN_ARM_SAMPLES = 5
+
+# Global effective sample gate for enabling the causal component at all.
+MIN_EFFECTIVE_N = 20
+
+# Empirical-Bayes-style shrinkage prior: ATE x n_eff/(n_eff + SHRINK_PRIOR).
+SHRINK_PRIOR = 20
+
+# IPTW weight truncation bounds (Hernan & Robins convention).
+IPTW_W_MIN = 0.05
+
+IPTW_W_MAX = 20.0
+
+# IPTW vs stratified disagreement threshold (audit only).
+IPTW_DISAGREEMENT = 0.15
+
+# The causal multiplier is bounded to the same [0.8, 1.2] band as the legacy
+# Beta multiplier: the causal engine is never more aggressive than status quo.
+CAUSAL_MULTIPLIER_CAP = 0.20
+
+MAX_CAUSAL_EVENTS_PER_UNIT = 200
+
+MAX_CAUSAL_EVENTS_PER_TASK = 100

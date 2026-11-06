@@ -19,6 +19,7 @@ import json
 import sys
 
 from reasoning_memory_core import handle_request
+from reasoning_memory_core.causal_utils import batch_causal_estimates, causal_estimate
 from reasoning_memory_core.constants import *  # noqa: F403
 from reasoning_memory_core.distillation import _make_memory
 from reasoning_memory_core.doc_chunking import chunk_document
