@@ -311,3 +311,117 @@ test('document retrieval with zero text signal returns empty with a readable not
   assert.equal(hit.documents.length >= 1, true)
   assert.equal(hit.documents[0].docName, 'memory_doc_standards')
 })
+
+// T-causal-debug: observational causal events derive exactly once per task.
+// A repeated memory_save_outcome in the same task (re-entry) must not record
+// a second event for the same memory, even with a different outcome.
+test('save_outcome derives causal events once per task', { timeout: 60_000 }, async () => {
+  const { ctx, tools, tables, listeners } = makeMockHost()
+  await apply(ctx, {
+    pythonExecutable,
+    maxMemories: 50, maxRetrievalRecords: 50, maxTrajectoryEvents: 1000, positiveNegativeRatio: 1,
+    vectorIndexEnabled: false, qdrantUrl: 'http://127.0.0.1:6333', qdrantCollection: 'reasoning_memories',
+    qdrantApiKeyEnv: 'QDRANT_API_KEY', embeddingUrl: '', embeddingModel: 'unused', embeddingDimension: 8,
+    embeddingApiKeyEnv: 'OPENAI_API_KEY', retrievalCandidatePoolSize: 100, vectorCandidatePoolSize: 100,
+    enterpriseRuleRagEnabled: false, enterpriseRuleRagRequired: false,
+    enterpriseRuleCollection: 'enterprise_reasoning_rules', enterpriseRuleSetId: '',
+    enterpriseRuleCandidatePoolSize: 20, enterpriseRuleResultLimit: 5, enterpriseRuleScoreThreshold: 0.3,
+    enterpriseRuleEmbeddingUrl: '', enterpriseRuleEmbeddingModel: '', enterpriseRuleEmbeddingDimension: 0,
+    enterpriseRuleQdrantApiKeyEnv: 'ENTERPRISE_RULES_QDRANT_API_KEY',
+    enterpriseRuleEmbeddingApiKeyEnv: 'ENTERPRISE_RULES_EMBEDDING_API_KEY',
+    captureReasoningEnabled: true, maxReasoningTextChars: 4000, llmDistillationEnabled: false,
+    llmDistillationTemperature: 1, distillationProvider: '', distillationModel: '',
+    maxMemoryItemsPerOutcome: 3, deSpecificationThreshold: 0.9, relevanceThreshold: 0,
+    memoryConsolidationEnabled: false, builtinStoreEnabled: false, builtinStoreDataDir: '',
+    apiConfigPath: '', skillsExportDir: '', minInsightConfidence: 0, deprecatedAfterHarmfulFeedback: 0,
+    templateMatchMin: 0.55,
+  })
+
+  // Task 1 seeds a memory.
+  const begin1 = await tools.get('memory_begin_task').execute({ task_desc: '重构解析函数', task_family: 'code' }, execFor('sc'))
+  emit(listeners, 'sc', 1, 'tool/call', { name: 'bash', callId: 'c1' })
+  emit(listeners, 'sc', 2, 'tool/result', { message: { source: { callId: 'c1' } } })
+  const saved = await tools.get('memory_save_outcome').execute({
+    outcome: 'success', verifier: 'pytest', evidence: '27 passed',
+    memory_items: [{ title: 't', description: 'd', content: '先定位失败点再修改', contraindications: [] }],
+  }, execFor('sc'))
+  const memoryId = saved.memoryIds[0]
+  await tools.get('memory_end_task').execute({ task_id: begin1.taskId }, execFor('sc'))
+
+  // Task 2 retrieves and rates, then saves TWICE with different outcomes.
+  const begin2 = await tools.get('memory_begin_task').execute({ task_desc: '重构解析函数', task_family: 'code' }, execFor('sc'))
+  await tools.get('memory_retrieve').execute({ query: '重构解析函数', k: 4 }, execFor('sc'))
+  await tools.get('memory_feedback').execute({ memory_ids: [memoryId], rating: 'helpful', evidence: 'worked' }, execFor('sc'))
+  emit(listeners, 'sc', 1, 'tool/call', { name: 'bash', callId: 'c2' })
+  emit(listeners, 'sc', 2, 'tool/result', { message: { source: { callId: 'c2' } } })
+  const firstSave = await tools.get('memory_save_outcome').execute({
+    outcome: 'success', verifier: 'pytest', evidence: '27 passed',
+    memory_items: [{ title: 't', description: 'd', content: '先定位失败点再修改', contraindications: [] }],
+  }, execFor('sc'))
+  assert.equal(firstSave.stored, true)
+  const secondSave = await tools.get('memory_save_outcome').execute({
+    outcome: 'fail', verifier: 'pytest', evidence: '2 failed',
+    memory_items: [{ title: 't', description: 'd', content: '先定位失败点再修改', contraindications: [] }],
+  }, execFor('sc'))
+  assert.equal(secondSave.stored, true)
+  await tools.get('memory_end_task').execute({ task_id: begin2.taskId }, execFor('sc'))
+
+  const causalEvents = [...tables.get('causal_events').entries()].map(([, event]) => event)
+  const task2Events = causalEvents.filter(event => event.taskId === begin2.taskId)
+  assert.equal(task2Events.length, 1, 're-entrant saves must derive the causal event once')
+  assert.equal(task2Events[0].memoryId, memoryId)
+  assert.equal(task2Events[0].treatment, 'used')
+  assert.equal(task2Events[0].outcome, 'success', 'the first recorded outcome wins')
+})
+
+// T-causal-debug C-O3 fix: standalone counterfactual arms (no active task)
+// must declare an explicit pair_id, so unrelated experiments can never be
+// silently paired into one paired ATE.
+test('standalone counterfactual arms require an explicit pair_id', { timeout: 60_000 }, async () => {
+  const seeded = memory('standalone-m')
+  const { ctx, tools, tables } = makeMockHost({ memories: [['standalone-m', seeded]] })
+  await apply(ctx, {
+    pythonExecutable,
+    maxMemories: 50, maxRetrievalRecords: 50, maxTrajectoryEvents: 1000, positiveNegativeRatio: 1,
+    vectorIndexEnabled: false, qdrantUrl: 'http://127.0.0.1:6333', qdrantCollection: 'reasoning_memories',
+    qdrantApiKeyEnv: 'QDRANT_API_KEY', embeddingUrl: '', embeddingModel: 'unused', embeddingDimension: 8,
+    embeddingApiKeyEnv: 'OPENAI_API_KEY', retrievalCandidatePoolSize: 100, vectorCandidatePoolSize: 100,
+    enterpriseRuleRagEnabled: false, enterpriseRuleRagRequired: false,
+    enterpriseRuleCollection: 'enterprise_reasoning_rules', enterpriseRuleSetId: '',
+    enterpriseRuleCandidatePoolSize: 20, enterpriseRuleResultLimit: 5, enterpriseRuleScoreThreshold: 0.3,
+    enterpriseRuleEmbeddingUrl: '', enterpriseRuleEmbeddingModel: '', enterpriseRuleEmbeddingDimension: 0,
+    enterpriseRuleQdrantApiKeyEnv: 'ENTERPRISE_RULES_QDRANT_API_KEY',
+    enterpriseRuleEmbeddingApiKeyEnv: 'ENTERPRISE_RULES_EMBEDDING_API_KEY',
+    captureReasoningEnabled: true, maxReasoningTextChars: 4000, llmDistillationEnabled: false,
+    llmDistillationTemperature: 1, distillationProvider: '', distillationModel: '',
+    maxMemoryItemsPerOutcome: 3, deSpecificationThreshold: 0.9, relevanceThreshold: 0,
+    memoryConsolidationEnabled: false, builtinStoreEnabled: false, builtinStoreDataDir: '',
+    apiConfigPath: '', skillsExportDir: '', minInsightConfidence: 0, deprecatedAfterHarmfulFeedback: 0,
+    templateMatchMin: 0.55,
+  })
+
+  // No active task and no pair_id: rejected with a readable reason.
+  const rejected = await tools.get('memory_record_counterfactual').execute(
+    { memory_id: 'standalone-m', arm: 'with', outcome: 'success' }, execFor('s-standalone'),
+  )
+  assert.equal(rejected.recorded, false)
+  assert.ok(rejected.note.includes('pair_id'))
+  assert.equal(tables.get('causal_events').size, 0)
+
+  // No active task with an explicit pair_id: accepted.
+  const accepted = await tools.get('memory_record_counterfactual').execute(
+    { memory_id: 'standalone-m', arm: 'with', outcome: 'success', pair_id: 'explicit-pair-1' },
+    execFor('s-standalone'),
+  )
+  assert.equal(accepted.recorded, true)
+  assert.equal(accepted.pairId, 'explicit-pair-1')
+
+  // The opposite arm with a DIFFERENT pair_id forms no pair with the first.
+  const otherPair = await tools.get('memory_record_counterfactual').execute(
+    { memory_id: 'standalone-m', arm: 'without', outcome: 'fail', pair_id: 'explicit-pair-2' },
+    execFor('s-standalone'),
+  )
+  assert.equal(otherPair.recorded, true)
+  const events = [...tables.get('causal_events').entries()].map(([, event]) => event)
+  assert.deepEqual(new Set(events.map(event => event.pairId)), new Set(['explicit-pair-1', 'explicit-pair-2']))
+})
