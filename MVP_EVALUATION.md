@@ -4,6 +4,14 @@
 **插件版本：0.2.0**  
 **范围：** 本地代码与公开论文/仓库的设计对照；本报告不声称已获得基准性能结果。
 
+## v0.6.0 迭代评估（2026-11-06）
+
+本轮以因果 AI 视角把**关联性效用反馈升级为因果信用分配**：新增独立 domain `reasoning_memory_causal`（因果事件，每记忆 FIFO 200 上限）、`memory_record_counterfactual` 配对续写记录原语、按任务模式分层（后门/分层调整）的 ATE/CATE 估计（Laplace 平滑、每臂 ≥5 层门槛、Wald CI）、IPTW 稳健性对照、辛普森悖论检测（`simpsonFlip` 告警）与保守集成（n_eff ≥20 门槛 + 收缩 ×n_eff/(n_eff+20) + 乘数 `1+clip(±0.20)` 与 Beta 同区间）。依据 8 篇 arXiv 复核论文（COMA/ProactAgent/Egami×2/Schölkopf/Kıcıman/Jin/Karimi/Retroformer）与 Pearl 因果层级经典，详见 `docs/research-notes/06-causal-ai.md` 与设计文档 §20。
+
+**验证状态**：TypeScript 构建干净；Python **145/145**（因果估计 14 项：合成已知因果结构下 ATE 恢复、CI 覆盖 ≥90%（10 种子）、辛普森构造检出 100%/无结构误报 0、IPTW 截断、双门槛边界、收缩单调、配对估计、双跑逐字节一致）；Node **42/42**（新增 causal.test.mjs + plugin-smoke 扩到 22 工具）；`scripts/eval` 指标与 v0.5.0 完全一致（recall 0.5714 / nDCG 0.4334 / 配额 1.0 / 自检索 0 —— 零回归达标）；`verify:bundle` 通过；`causalApplied=false` 时检索行为与 v0.5.0 基线逐字节一致（测试锁定）。
+
+**本轮诚实边界**：识别假设 5 条（可忽略性/SUTVA/处置良定义/结局良定义/verdict=代理标签）如实声明——因果估计仅在已观测混杂（任务模式/族/模型版本/检索意图/步骤位）下成立，存在未观测混杂则有偏；自报 verdict 是代理标签（Egami DSL 2306.04746 教训），故因果结局用环境 outcome；估计全部确定性计数完成、不委托 LLM（Kıcıman 2305.00050）；模板因果事件（kind='template'）schema 已预留但无写入路径（L2 处置的完整落地留待标注集）；因果分量不改变 RRF 权重与正反配额，且乘数区间与 Beta 相同——因果引擎永不比现状更激进。
+
 ## v0.5.0 迭代评估（2026-11-04）
 
 本轮新增第三个检索面「推理检索 RAG」：用户导入公司开发规范等文档，做四层映射对齐的推理感知检索（L1 任务模式软过滤、L2 模块需求 kind `retrieve_document`、L3 独立 domain `reasoning_memory_documents` + 独立 BM25/向量索引、L4 步骤对齐文档检索）。依据 8 篇前沿论文（Self-RAG/RAPTOR/GraphRAG/HippoRAG/Step-Back/HyDE/Adaptive-RAG/IRCoT，数字经 arXiv 复核，见 `docs/research-notes/05-reasoning-rag.md`），严格只做 stdlib 确定性近似（标题层级分块 + 块链接图 + 有界 BFS 多跳 ≤2 + 确定性查询展开），LLM 摘要/实体抽取/假设文档/训练路由/全局总结全部越界。

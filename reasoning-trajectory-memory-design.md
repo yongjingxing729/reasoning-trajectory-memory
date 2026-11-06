@@ -706,6 +706,34 @@ reasoning-trajectory-memory/（本仓库根目录即 DSH 插件包）
 
 ---
 
+## 20. 因果效用引擎落地（2026-11-06 迭代，v0.6.0）
+
+### 20.1 因果诊断
+
+v0.5.0 的效用反馈是**关联性**的：`0.8 + 0.4×(helpful+1)/(helpful+harmful+2)` 估计 P(成功|用过记忆)，不回答"使用记忆是否**导致**成功"。混杂（任务模式同时影响"检索了什么"与"是否成功"）与选择性偏差（好记忆被用在简单任务上）都会失真——ToE 报告的"朴素经验管理常低于无经验基线"正是此类失真的实例。本迭代把反馈升级为**因果信用分配**：估计处理效应 E[Y|do(m)]−E[Y|do(¬m)]，以有界、保守、可审计的方式进入检索排序。
+
+### 20.2 核心机制
+
+- **反事实信用分配（一等原语）**：`memory_record_counterfactual` 记录配对续写双臂（同前缀有/无检索的结局对比，COMA 式反事实基线；综述 §6.5 / ProactAgent [7]）。
+- **观察性因果估计**：按任务模式（L1）分层的 ATE/CATE（后门/分层调整，Laplace 平滑，每臂 ≥5 层门槛 + Wald CI）；IPTW 仅作稳健性对照（差异 >0.15 审计 iptwDisagreement，不喂排序）。
+- **辛普森悖论防护**：粗效应符号与分层效应符号相反且双侧显著 → `simpsonFlip` 告警，排序一律采用分层估计。
+- **保守集成**：n_eff ≥20 才启用因果分量；收缩 ATE×n_eff/(n_eff+20)；乘数 `1+clip(ATE_shrunk, ±0.20)` 与 Beta 乘数同区间 [0.8,1.2]——**因果引擎永不比现状更激进**；样本不足自动回退 Beta 效用（零回归可测）；负效应只压低不删除。
+
+### 20.3 四层映射对齐
+
+| 层 | 因果落点 |
+|---|---|
+| L1 任务模式 | **混杂分层主键**：stratification/backdoor 的 stratum s；CATE 逐层输出 |
+| L2 策略模板 | **处置分配 do(template)**：模板选择即策略处置；模板效用同款升级 |
+| L3 能力模块 | causalMeta additive 元数据（ATE/CATE/样本量/辛普森标记）；Beta 计数保留为回退先验 |
+| L4 激活动作 | **干预 do(retrieve)**：treatment 定义；配对续写 = 显式反事实干预对照 |
+
+### 20.4 识别假设与越界（诚实边界）
+
+识别假设 5 条（可忽略性/SUTVA/处置良定义/结局良定义/verdict=代理标签）如实写入文档：仅控制在已观测混杂下成立；自报 verdict 是代理标签（Egami DSL 2306.04746 的教训），故因果结局用环境 outcome 而非 verdict。越界 7 条：在线因果发现、LLM 生成反事实/效应判断（Kıcıman 2305.00050："LLMs ignore the actual data"）、梯度优化（Retroformer）、DML 双重稳健、文本嵌入学混杂、因果分进配额、插件代行配对续写。完整公式与论文依据见 `docs/spec-0.6.0.md` 与 `docs/research-notes/06-causal-ai.md`。
+
+---
+
 ## 附录：评审记录
 
 - 2026-10-25 第 1 组（架构 + 数据模型 + 生命周期）确认，含补充"存储的推理模块对进行中任务的作用"（四作用点）；
@@ -720,3 +748,4 @@ reasoning-trajectory-memory/（本仓库根目录即 DSH 插件包）
 - 2026-10-28 企业规则 RAG：增加独立只读企业规则 collection、固定 ruleSet scope 和有效期过滤、按需/required 配置、来源/版本返回及 retrieval audit 状态；规则正文不写入经验记忆或审计记录。参考 Qdrant read-only keys 与 payload filtering 和 OWASP RAG 间接注入风险建议；尚未运行真实企业 KB 与 DSH profile 验证。
 - 2026-11-02 四层映射落地（v0.4.0）：依据《推理模块高效复用》综述（30 篇文献）新增策略模板库、7 类任务模式分类、激活计划（`memory_plan_task`）、模板挖掘/发布、检索 template 通道与步骤对齐参数、洞察置信度写入门控、保守弃用标记与 `scripts/eval` 离线评测 harness。路径 A（上下文级）落地，路径 B/C/E（LoRA/SAE/RL 权重级）为文档化越界项（见 §18.4）。DSH 契约经双人核实：v1 domain 新增 templates 表不破坏旧介质（无表结构哈希、缺失表回填空 Map、逐记录读取边界校验），templates 表 schema 铁律为 additive。模板通道 RRF 权重（template 0.15 主臂 / structure 0.05+template 0.20 备选臂）与分类器/挖掘阈值均为待标注集校准的初值。
 - 2026-11-04 推理检索 RAG（v0.5.0）：新增第三个检索面——用户导入开发规范文档，做四层映射对齐的推理感知检索（L1 模式软过滤、L2 新增模块需求 kind `retrieve_document`、L3 独立 domain `reasoning_memory_documents` + 独立索引、L4 步骤对齐文档检索）。依据 8 篇前沿推理 RAG 论文（Self-RAG/RAPTOR/GraphRAG/HippoRAG/Step-Back/HyDE/Adaptive-RAG/IRCoT，数字经 arXiv 复核），严格只做 stdlib 确定性近似（标题层级分块 + 块链接图 + 有界 BFS 多跳 + 确定性查询展开），LLM 摘要/实体抽取/假设文档/训练路由/全局总结全部越界（见 §19）。硬边界：文档检索不进记忆 RRF 通道与正反配额；企业规则 RAG 与记忆检索零回归。
+- 2026-11-06 因果效用引擎（v0.6.0）：把关联性 Beta 效用反馈升级为因果信用分配——按任务模式分层（后门/分层调整）的 ATE/CATE + IPTW 稳健对照 + 配对续写反事实记录原语（`memory_record_counterfactual`）+ 辛普森悖论检测告警；因果乘数 `1+clip(ATE×n_eff/(n_eff+20), ±0.20)` 与 Beta 乘数同区间、永不更激进，样本不足自动回退 Beta（零回归可测）。独立 domain `reasoning_memory_causal` 存因果事件（FIFO 上限）。识别假设 5 条与越界 7 条写入 §20.4：仅控制在已观测混杂下成立；verdict 是代理标签、因果结局用环境 outcome；估计全部确定性计数完成、不委托 LLM。依据 8 篇 arXiv 复核论文（COMA/ProactAgent/Egami×2/Schölkopf/Kıcıman/Jin/Karimi/Retroformer）与 Pearl 因果层级经典，详见 `docs/research-notes/06-causal-ai.md`。

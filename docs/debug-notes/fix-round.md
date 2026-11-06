@@ -201,3 +201,41 @@
 | R5–R10 | 📝 只记录 | 已记入上表观察项，未改代码 |
 
 **回归**：prepare ✅ ｜ test:python **131/131** ✅（新增 DocumentAdversarialTests 8 项）｜ Node 直跑 8 文件全绿（adversarial 6/6、documents、smoke 等）｜ scripts/eval ✅ 指标不变（recall 0.5714 / ndcg 0.4334 / quota 1.0 / selfRetrieval 0 / classify 1.0 / templateTop1 1.0）。解耦零回归确认：记忆/模板/企业规则路径未改一行（retrieval.py、templates.py、enterprise-rules-rag.ts 本轮零改动），domain 仅 retrievalRecordSchema additive 字段（developer 在 task-22 已加）。
+
+---
+
+# T-causal-debug（task-31，v0.6.0 因果效用引擎）轮记录
+
+- 开始：2026-11-06。基线：prepare ✅（0.6.0）｜ test:python 145/145 ✅ ｜ Node 直跑 9 文件全绿 ✅ ｜ scripts/eval 指标与 v0.5.0 持平（recall 0.5714 / ndcg 0.4334 / quota 1.0 / selfRetrieval 0 / classify 1.0 / templateTop1 1.0）。
+- 读审范围：causal_utils.py、service.py（causal/classify operation）、retrieval.py 因果接入、causal-domain.ts、domain.ts additive 审计字段、index.ts（写事件/FIFO/save 派生/record_counterfactual/memory_query include_causal）。
+
+## 对抗探测结论：估计量全部边界通过，无代码缺陷
+
+| 对抗面 | 结果 | 验证方式 |
+| --- | --- | --- |
+| 每臂 4/5/6 门槛 | ✅ 4 剔除（droppedStrata + reason sample gate）、5/6 合格 | 探测 + 本轮新增精确断言（开发者已测 4 侧） |
+| n_eff 19/20/21 | ✅ 19 回退 Beta、20/21 应用（causalApplied 精确翻转） | 探测 + 新增测试 |
+| 收缩封顶 ±0.20 | ✅ 极端效应处 causalMultiplier 恰好 1.2 / 0.8；shrunk 单调于 n_eff | 探测 + 新增测试 |
+| 配对缺臂/奇数臂 | ✅ 缺臂 pairedPairs=0/pairedAte=0；重复臂 setdefault first-wins 确定性 | 探测 + 新增测试 |
+| IPTW 极端倾向/除零 | ✅ 1/199 裁剪计数≥1、disagreement 标记；全处理组（无对照）weight_sum=0 → None→0.0，无除零 | 探测 + 开发者既有测试 |
+| Laplace 零格 | ✅ 开发者已测（zero cells 不崩、CI 有序） | 既有 |
+| 辛普森检出/误报 0 | ✅ 构造检出、无结构不误报（双侧显著门槛） | 开发者既有 + 探测复核 |
+| ATE 恢复与 CI 覆盖 | ✅ 10 种子合成结构 CI 覆盖 ≥90% | 开发者既有 |
+| 确定性双跑逐字节一致 | ✅ json sort_keys 全等 | 开发者既有 |
+| causalApplied=false 零回归 | ✅ Beta 乘数逐值相等（retrieval 路径）；无事件键时走 v0.5.0 路径 | 开发者既有 + 探测 |
+| FIFO 裁剪边界 | ✅ 210 → 200，最旧剔除、createdAt 有序 | 开发者既有 |
+| save_outcome 派生事件重入幂等 | ✅ 同任务二次 save 不再派生（causalEventsRecorded 门），首记 outcome 胜出 | **本轮新增** adversarial.test.mjs |
+| 记忆/模板/文档/企业规则零回归 | ✅ 全量 145 项 Python + 9 文件 Node 全绿 + eval 持平 | 全量回归 |
+
+## 观察项（记录不修，供后续迭代）
+- C-O1 🟢：save_outcome 派生观察性事件的 stepIndex/retrievalIntent 硬编码 0/''——spec 把二者列为混杂元数据，但 TS 未从活动任务状态填充（与检索步骤对齐参数脱节）。index.ts:2223-2224。
+- C-O2 🟢：memory_record_counterfactual 在无活动任务时无幂等防护（counterfactualRecorded 仅活动任务内生效），同一 (pair,arm) 可重复落库；配对估计 setdefault first-wins 使估计不受污染，仅占 FIFO 配额。index.ts:2324。
+- C-O3 🟢→✅ 已修：无任务时 pairId 默认 `standalone:{memoryId}` 全局稳定 → 两次独立 standalone 调用（一 with 一 without）会被视为同一对。lead 裁决小修：**standalone 模式必须显式 pair_id**，缺失拒绝并返回可读错误；活动任务内保留默认（任务+记忆幂等）。index.ts（memory_record_counterfactual execute + 工具描述 + pair_id 参数描述）。测试：adversarial.test.mjs “standalone counterfactual arms require an explicit pair_id”（缺 pair_id 拒绝且零落库、显式 pair_id 接受、不同 pair_id 不误配）。
+- C-O4 🟢：派生事件 eventId 同毫秒同参数时 put 覆盖（幂等无害）；FIFO 排序 createdAt+eventId 双键确定性良好。index.ts:2216。
+
+## 新增测试
+- test_reasoning_memory.py `CausalBoundaryTests` 7 项（臂门槛 5/6+4、n_eff 20/21、封顶极值、shrunk 单调、配对缺臂/重复臂、全处理组保守）。
+- test/adversarial.test.mjs 新增 “save_outcome derives causal events once per task”（重入幂等 + 首记 outcome 胜出）。
+
+## 结论
+因果引擎 MVP 经受住全部对抗面；估计量与接线零缺陷。唯一修复为 lead 裁决的 C-O3（standalone 配对防护）。最终回归：prepare ✅ ｜ test:python **151/151** ✅（新增 CausalBoundaryTests 6 项）｜ Node 直跑 9 文件全绿（adversarial 8/8：CausalBoundary 相关 + save 重入幂等 + standalone pair 防护）｜ scripts/eval ✅ 指标与 v0.5.0 持平。

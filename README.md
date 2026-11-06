@@ -97,6 +97,17 @@ endpoints:                # 命名端点；插件按名字引用，按 kind 校�
 - **离线评测**：`scripts/eval`（不进发货包）提供 episode 标注 JSONL 校验、种子化合成数据生成、检索质量（Recall@k/nDCG@k 按 outcome、配额遵守率、自检索率、misleading 误召回）、模板评测（分类 accuracy、匹配 top-k、挖掘纯度/覆盖率）与通道消融矩阵，`python scripts/eval/run_eval.py` 产出 Markdown 报告；样例报告明确标注合成 ≠ 真实标注。
 - **边界声明**：综述的路径 B（LoRA 组合）/ C（SAE 特征干预）/ E（RL 联合决策学习）不在本插件落地——DSH 插件无权重与潜空间访问权限，且拒绝方向干预的双刃剑风险 [24] 要求激活保持在上下文/工具/技能注入这一可审计、可回滚的层面。本迭代的"激活"是可执行的计划动作，不改变模型内部计算；过程级反馈是低代价在线信号，不是校准的强化学习奖励。设计细节与 30 篇文献映射见设计文档 §18。
 
+### 因果效用引擎（v0.6.0）
+
+v0.5.0 的效用反馈是**关联性**的（Beta 计数估计 P(成功|用过记忆)），回答不了"使用记忆是否**导致**成功"。v0.6.0 把它升级为**因果信用分配**——估计处理效应 E[Y|do(m)]−E[Y|do(¬m)]，以有界、保守、可审计的方式进入检索排序：
+
+- **反事实记录（一等原语）**：`memory_record_counterfactual` 记录配对续写双臂（同前缀有/无检索的结局对比，COMA 式反事实基线；配对由 agent/harness 执行，插件只记录与估计）。
+- **观察性因果估计**：`memory_save_outcome` 自动从活动任务状态派生因果事件（用了哪些记忆 + 结局 + 任务模式等混杂），Python 按任务模式分层（后门/分层调整）估计 ATE/CATE（Laplace 平滑、每臂 ≥5 层门槛、Wald 置信区间）；IPTW 仅作稳健性对照（与分层估计差异 >0.15 审计告警，不喂排序）。
+- **辛普森悖论防护**：粗效应与分层效应符号相反且双侧显著 → `simpsonFlip` 告警，排序一律采用分层估计（ToE"朴素经验管理常低于无经验基线"正是此类失真）。
+- **保守集成**：有效样本 ≥20 才启用因果分量；收缩 ATE×n_eff/(n_eff+20)；乘数 `1+clip(ATE_shrunk, ±0.20)` 与 Beta 乘数同区间 [0.8,1.2]——**因果引擎永不比现状更激进**；样本不足自动回退 Beta 效用（`causalApplied=false`，与 v0.5.0 行为逐字节一致）；负效应只压低不删除。
+- **审计**：检索结果逐候选带 `causalUplift/causalSamples/simpsonParadox/causalStrata/estimatorVersion`；`memory_query` 加 `include_causal` 可查因果统计摘要。
+- **诚实边界**：识别假设 5 条（可忽略性/SUTVA/处置良定义/结局良定义/verdict=代理标签）——仅控制在已观测混杂（任务模式/族/模型版本/检索意图/步骤位）下成立；因果结局用环境 outcome 而非自报 verdict；估计全部由确定性计数完成，不委托 LLM；因果分不进 RRF 权重与正反配额。论文依据见设计文档 §20 与 `docs/research-notes/06-causal-ai.md`。
+
 ### 混合检索与可选向量索引
 
 - 本地 BM25 倒排索引索引推理教训、任务情境、前提、工具动作和图标签；中文按单字/二元组匹配，英文及数字按词项匹配。成功和失败分别取 Top-N，默认各 100 条。
@@ -222,6 +233,8 @@ reasoning-memory:
 v0.4.0 的策略模板库与激活动作化依据《面向 LLM 智能体的推理模块高效复用研究综述（终稿）》及其 30 篇已核实文献（四层映射骨架与路径 A；完整映射表与越界声明见设计文档 §18），其中关键数字已经独立复核（`docs/research-notes/03-survey-facts.md`）：Tree-of-Experience（arXiv:2608.09044）Game of 24 相对无经验 ToT 基线 +31.4%、FinEvolveBench tsIC 平均 +41.24%（12 个评测设置）；ProactAgent（arXiv:2604.20572）SciWorld/AlfWorld/StuLife 成功率相对提升 up to 32%、交互轮次减少 over 33%；MemWeaver（arXiv:2601.18204）LoCoMo 输入上下文长度相对长上下文基线压缩 over 95%；EvolveR（arXiv:2510.16079）"离线自蒸馏 → 在线交互 → 策略进化"三组件（正文 §3）与 (c_succ+1)/(c_use+2) 效用分；LoRAHub（arXiv:2307.13269）组合不引入新参数、不需梯度（CMA-ES）。
 
 v0.5.0 的推理检索 RAG 依据 8 篇前沿论文（完整映射与越界声明见设计文档 §19 与 `docs/research-notes/05-reasoning-rag.md`，数字均经 arXiv 摘要复核）：Self-RAG（arXiv:2310.11511，按需检索→模板步骤 `retrieve_document` 声明式近似）、RAPTOR（arXiv:2401.18059，多层表示→标题层级分块，QuALITY +20% 依赖 LLM 摘要层故不复制）、GraphRAG（arXiv:2404.16130，全局总结越界）、HippoRAG（arXiv:2405.14831，图扩散单步→有界 BFS 多跳）、Step-Back（arXiv:2310.06117，抽象改写→确定性词表泛化）、HyDE（arXiv:2212.10496，查询展开）、Adaptive-RAG（arXiv:2403.14403，路由→模块需求声明）、IRCoT（arXiv:2212.10509，多跳检索价值）。
+
+v0.6.0 的因果效用引擎依据因果 AI 文献（完整公式、识别假设与越界声明见设计文档 §20 与 `docs/research-notes/06-causal-ai.md`）：Pearl 因果层级/后门准则/do-calculus（经典，非 arXiv）；COMA（arXiv:1705.08926，反事实基线的配对续写出处）；ProactAgent（arXiv:2604.20572，paired continuations 过程奖励）；Egami（arXiv:1802.02163 文本因果识别问题；arXiv:2306.04746——自报 verdict 是代理标签，替代准确率 80–90% 仍有实质偏差 → 必须收缩）；Schölkopf（arXiv:2102.11107，因果表示学习越界声明）；Kıcıman（arXiv:2305.00050，"LLMs ignore the actual data" → 估计不委托 LLM）；Jin（arXiv:2306.05836，LLM 纯因果推断近随机）；Karimi（arXiv:2002.06278，反事实解释≠干预建议）；Retroformer（arXiv:2308.02151，梯度式优化越界）。
 
 - Ouyang et al., [ReasoningBank: Scaling Agent Self-Evolving with Reasoning Memory](https://arxiv.org/abs/2509.25140), ICLR 2026。
 - 官方实现：[google-research/reasoning-bank](https://github.com/google-research/reasoning-bank)。该仓库提供 SWE-Bench 与 WebArena 实验代码；本插件复用其成功/失败经验蒸馏、检索、回写的核心框架思想，不复制其 benchmark harness。
