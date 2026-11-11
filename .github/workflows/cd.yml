@@ -26,6 +26,8 @@ jobs:
         run: npm ci
       - name: Build (TypeScript)
         run: npm run prepare
+      - name: Architecture invariants
+        run: npm run verify:structure
       - name: Python core tests
         run: npm run test:python
       - name: Node tests

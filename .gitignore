@@ -5,5 +5,6 @@ __pycache__/
 *.pyc
 /.reasoning-memory-data/
 /.npm-cache-tmp/
+/artifacts/
 .env
 /.vscode/

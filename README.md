@@ -215,12 +215,52 @@ reasoning-memory:
   builtinStoreDataDir: .reasoning-memory-data   # 留空 = 纯内存（每次启动从 storageDomain 重建）
 ```
 
+## 代码结构
+
+TypeScript 适配层按"组合根 → 工具层 → 层实现"单向依赖拆分（由原 `src/index.ts` 单体拆出）；推理算法在随包分发的 Python stdlib 核心中，TypeScript 只通过固定 worker 路径调用。
+
+```
+src/
+├── index.ts          # Cordis 入口/组合根：name/inject、Config 再导出、apply()（创建 runtime、注册 7 组工具）
+├── config.ts         # 插件配置 schema 与默认值
+├── types.ts          # 跨层共享响应/传输类型
+├── tool-schemas.ts   # 工具输出 JSON schema（纯常量）
+├── helpers.ts        # renderJson / isRecord / session id / clipText
+├── capture.ts        # 捕获层：session/event → CapturedEvent/ActiveTask，活动任务注册表
+├── storage-layer.ts  # 记忆库：storageDomain 各 domain/表、事件日志 FIFO、结构化扫描、模板播种
+├── index-layer.ts    # 检索层：BM25/向量索引/内置库/企业规则 RAG/API 配置接线与降级状态
+├── skill-export.ts   # Agent-Skill 文件系统导出（best-effort）
+├── runtime.ts        # 依赖容器：组合各层、RuntimeState、Python 版本门、ctx.effect 生命周期
+├── domain.ts / *-domain.ts  # 记忆/技能/文档/因果/量子/提炼因果 domain schema
+├── python.ts / search-text.ts / lexical-index.ts / vector-index.ts / document-*.ts /
+│   builtin-store.ts / api-config.ts / enterprise-rules-rag.ts / skill-format.ts /
+│   distillation-llm.ts / embedding-client.ts   # 桥/索引/存储 adapter 等扁平模块
+└── tools/            # 工具层：memory-lifecycle / memory-retrieval / memory-consolidation /
+                      #         templates / documents / skills / admin
+python/
+├── reasoning_memory.py        # 稳定 CLI worker 入口（stdio JSON；受限环境自动 --file-io）
+└── reasoning_memory_core/     # 按功能拆分：trajectory / retrieval / distillation / causal /
+                               # qprobability / doc_* / templates（门面 + template_*）等
+```
+
+依赖方向只能向下（`tools/*` 之间禁止互相 import；工具层另可直接使用 `helpers` / `tool-schemas` / `types` 等无副作用共享模块）：
+
+```
+index.ts → tools/* → runtime → capture / storage-layer / index-layer / skill-export
+                                          → config / types / helpers / domain 模块
+```
+
+加功能时：新工具放 `src/tools/<组>.ts` 并在 `src/index.ts` 的 `apply()` 注册；新存储域先在 `src/*-domain.ts` 定义、由 `storage-layer.ts` 打开；新检索通道在独立索引模块实现、由 `index-layer.ts` 接线并向工具暴露。上述依赖方向与文件规模由 `scripts/verify-structure.mjs`（`npm run verify:structure`）在 `npm test` 中强制校验；运行时生命周期、降级语义、扩展步骤与不可回归约束详见 [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)。
+
 ## 本地测试与 CI/CD
 
-在仓库根目录运行 `npm test`，依次执行 TypeScript 构建、Python 核心 `unittest` 和 Node 测试；也可分别运行 `npm run test:python`、`npm run test:node`（索引/内置库/API 配置 + 插件部署冒烟）。Node 用例通过 mock HTTP 验证 Qdrant/embedding REST 请求，并通过真实进程内 PGlite（含 pgvector/HNSW）验证内置库的同步、向量检索、结构化查询与降级，不要求本机启动任何服务。测试用例已随仓库提交（早期 `.gitignore` 排除测试的约定已解除，CI 需要测试入库）。
+在仓库根目录运行 `npm test`，依次执行 TypeScript 构建（`npm run prepare`）、架构不变量校验（`npm run verify:structure`）、Python 核心 `unittest` 和 Node 测试；也可分别运行 `npm run test:python`、`npm run test:node`。测试按发现规则组织，不依赖任何单一文件名：
 
-- **CI**（`.github/workflows/ci.yml`）：push/PR 在 ubuntu 与 windows 双平台跑构建、Python 31 项与全部 Node 测试（含插件部署冒烟测试——用 mock Cordis 宿主加载打包产物、驱动完整记忆生命周期、跑真实 Python worker 与进程内 PGlite）。
-- **CD**（`.github/workflows/cd.yml`）：tag `v*` 或手动触发时构建测试 → `npm pack` 打包 → 校验发货 tarball 内容（`npm run verify:bundle`）→ **部署冒烟**：解包后从 tarball 内的 `dist/index.js` 引导插件（`PLUGIN_BUNDLE_ENTRY` 指向解包产物），证明发货包在 DSH 宿主之外即可安装部署。真实 `dsh plugin add` 安装仍为手动步骤（DSH 桌面运行时未在 runner 上无头安装）。
+- **Node**：`node --test test/*.test.mjs`（索引/内置库/API 配置/检索/文档/模板/技能/因果/量子/对抗 + 插件部署冒烟）。用例通过 mock HTTP 验证 Qdrant/embedding REST 请求，并通过真实进程内 PGlite（含 pgvector/HNSW）验证内置库的同步、向量检索、结构化查询与降级，不要求本机启动任何服务。
+- **Python**：`python -m unittest discover -s test`（经 `scripts/run-python-tests.mjs` 跨平台选择解释器并校验 3.10+）。`test/test_*.py` 按检索、蒸馏、文档、因果、量子、模板、JSON 桥等面拆分，共享夹具放在 `test/_support.py`。
+- 测试用例已随仓库提交（早期 `.gitignore` 排除测试的约定已解除，CI 需要测试入库）；npm `files[]` 白名单不含 `test/`，因此测试不进入发货包。
+- **CI**（`.github/workflows/ci.yml`）：push/PR 在 ubuntu 与 windows 双平台跑构建、架构不变量校验（`npm run verify:structure`）、Python 核心 187 项 `unittest` 与全部 Node 测试（含插件部署冒烟测试——用 mock Cordis 宿主加载打包产物、驱动完整记忆生命周期、跑真实 Python worker 与进程内 PGlite）。架构不变量（入口/分层/工具分组/文件大小/发货清单）规则见 [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) 与 `scripts/verify-structure.mjs`。
+- **CD**（`.github/workflows/cd.yml`）：tag `v*` 或手动触发时构建测试 → `npm pack` 打包 → 校验发货 tarball 内容（`npm run verify:bundle`：dist/ 各层与工具模块、Python 全核心、入口体积上限）→ **部署冒烟**：解包后从 tarball 内的 `dist/index.js` 引导插件（`PLUGIN_BUNDLE_ENTRY` 指向解包产物），证明发货包在 DSH 宿主之外即可安装部署。真实 `dsh plugin add` 安装仍为手动步骤（DSH 桌面运行时未在 runner 上无头安装）。
 - Python 桥接在受限环境（沙箱/服务上下文）自动降级：管道 stdio 被拒（EPERM）时切换为 `--file-io` 临时文件传输。
 
 ## 模型侧生命周期

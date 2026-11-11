@@ -137,7 +137,7 @@ DeepSeek Harness 宿主（已存在，本插件不修改）
 ├─ 记忆库：MemoryItem 存储（语义路 + 结构路双索引）+ 检索日志
 ├─ 检索层：语义路 + 结构路 → 固定融合 → Top-k 摘要
 ├─ Python 推理核心：outcome → 推理策略/结构蒸馏 + 双路检索 + 正反配比
-└─ 工具层：memory_begin_task / memory_retrieve / memory_save_outcome / memory_end_task
+└─ 工具层：22 个 memory_* 工具（生命周期 5 / 检索 2 / 整合 1 / 模板 4 / 文档 5 / 技能 4 / 管理 1）
 ```
 
 MVP 只启用"捕获 + 按需检索"；隐藏式逐轮注入、自动重试、在线 bandit 暂不启用。
@@ -148,7 +148,7 @@ MVP 只启用"捕获 + 按需检索"；隐藏式逐轮注入、自动重试、�
 |---|---|---|
 | 网关层（捕获请求/响应/工具事件） | `dsh-session` 的 `session/event` 事件流 + `dsh-llm` 适配器字段 | 事件顺序是首要观测对象；reasoning 文本是可缺失字段 |
 | TrajectoryEvent | `SessionEvent`（信封 `{ seq, type, data }`） | 本插件按类型投影为记忆侧事件 |
-| MCP Server（任务生命周期/检索/回写） | 本插件注册的 4 个工具 | `memory_begin_task` / `memory_retrieve` / `memory_save_outcome` / `memory_end_task` |
+| MCP Server（任务生命周期/检索/回写） | 本插件注册的 22 个 `memory_*` 工具 | 生命周期 5 / 检索 2 / 整合 1 / 模板 4 / 文档 5 / 技能 4 / 管理 1，按生命周期分 7 组注册 |
 | 核心逻辑（提取/检索） | 随插件 bundle 分发的 Python 核心，由 TypeScript 适配层调用；持久化通过 `ctx.storageDomain` | 单请求 JSON stdin/stdout 协议；不启动独立服务 |
 | 语义路（必备基线） | 任务描述/目标的文本相似度 | MVP 用本地可复现相似度（见 §7） |
 | 结构路（主研究） | 从工具调用/验证事件抽象"有限标签集 + 步骤序列签名" | 标签集：分解/约束/搜索/执行/验证/回退 |
@@ -164,7 +164,7 @@ MVP 只启用"捕获 + 按需检索"；隐藏式逐轮注入、自动重试、�
 | 记忆库 | MemoryItem 增删查、双路索引、检索日志、离线评测接口 | 研究主线直接调用同一实现，减少工程版与实验版偏差 |
 | 检索层 | 语义路与结构路独立召回 + 固定融合 + Top-k | 保留每路候选、分数、排序与注入记录（供消融） |
 | 蒸馏层 | 任务终态 + 验证证据 → 策略/结构/失败教训条目 | 域内验证器证据作门控；失败不可归因时保留 unknown |
-| 工具层 | 4 个面向模型的工具 | 记忆作为带来源的数据块提供，不升级为指令 |
+| 工具层 | 22 个面向模型的 `memory_*` 工具（生命周期 5 / 检索 2 / 整合 1 / 模板 4 / 文档 5 / 技能 4 / 管理 1） | 记忆作为带来源的数据块提供，不升级为指令 |
 
 ### 2.4 关联机制（轨迹 ↔ 任务配对）
 
@@ -523,18 +523,50 @@ M1 能力盘点与竖切片 → M2 pilot / baseline / harness → M3 主假设�
 
 ```
 reasoning-trajectory-memory/（本仓库根目录即 DSH 插件包）
-├── package.json       # npm 包 + dsh.bundle.patch manifest
-├── cordis.patch.yml   # 将插件行插入 DSH profile
+├── package.json          # npm 包 + dsh.bundle.patch manifest（files[] 为发货白名单）
+├── cordis.patch.yml      # 将插件行插入 DSH profile
+├── tsconfig.json         # rootDir=src、outDir=dist，dist/ 与 src/ 同构
 ├── README.md
-├── tsconfig.json
-├── src/
-│   ├── index.ts       # Cordis 入口、session/event 捕获、5 个 memory_* 工具
-│   ├── domain.ts      # DSH storage-domain schemas
-│   ├── python.ts      # 可取消的 Python JSON bridge
-│   ├── search-text.ts # 记忆/查询的词面与嵌入文本构造
-│   ├── lexical-index.ts # BM25 倒排候选索引
-│   ├── vector-index.ts  # 可选 Qdrant + embeddings REST adapter
-│   └── enterprise-rules-rag.ts # 独立、只读、按 ruleSet 隔离的企业规则 RAG
+├── reasoning-trajectory-memory-design.md
+├── docs/                 # 版本 spec、调研笔记、评测说明与 ARCHITECTURE.md
+├── scripts/              # 本地评测与构建/发货校验脚本（不进 npm 包）
+├── src/                  # TypeScript 适配层（Cordis bundle）
+│   ├── index.ts          # 组合根：name / inject / Config 再导出 / apply()（创建 runtime、注册 7 组工具）
+│   ├── config.ts         # 插件配置：Config 接口 + schemastery schema 与默认值
+│   ├── types.ts          # 跨层共享的响应/传输类型
+│   ├── tool-schemas.ts   # 工具输出 JSON schema（纯常量）
+│   ├── helpers.ts        # renderJson / isRecord / session id / clipText 等纯函数
+│   ├── capture.ts        # 捕获层：session/event → CapturedEvent/ActiveTask，活动任务注册表
+│   ├── storage-layer.ts  # 记忆库：打开 6 个 domain、事件日志 FIFO、结构化扫描、内置模板播种、close
+│   ├── index-layer.ts    # 检索层：Qdrant/内置库/企业规则 RAG/API 配置接线与降级状态
+│   ├── skill-export.ts   # Agent-Skill 文件系统导出（best-effort 副作用）
+│   ├── runtime.ts        # 依赖容器：组合各层、RuntimeState、Python 版本门、ctx.effect 生命周期
+│   ├── tools/            # 工具层：按记忆生命周期分组，禁止互相 import
+│   │   ├── memory-lifecycle.ts     # begin_task / end_task / save_outcome / feedback / record_counterfactual
+│   │   ├── memory-retrieval.ts     # retrieve / query
+│   │   ├── memory-consolidation.ts # consolidate
+│   │   ├── templates.ts            # plan_task / list / load / publish_template
+│   │   ├── documents.ts            # import / list / load / retrieve / delete document
+│   │   ├── skills.ts               # publish / list / load / load_skill_resource
+│   │   └── admin.ts                # api_status
+│   ├── domain.ts         # 记忆/模板/检索审计 domain（version 1）
+│   ├── document-domain.ts      # 文档语料独立 domain（v0.5.0，version 1）
+│   ├── causal-domain.ts        # 因果事件独立 domain（v0.6.0，version 1）
+│   ├── quantum-domain.ts       # 量子叠加/坍缩审计独立 domain（v0.7.0，version 1）
+│   ├── distill-causal-domain.ts # 提炼侧因果事件独立 domain（v0.8.0，version 1）
+│   ├── skill-domain.ts   # 技能独立 domain（version 1）
+│   ├── python.ts         # 可取消的 Python JSON bridge（stdio + --file-io 降级）
+│   ├── search-text.ts    # 记忆/查询的词面与嵌入文本构造
+│   ├── lexical-index.ts  # 记忆 BM25 倒排候选索引
+│   ├── vector-index.ts   # 可选 Qdrant + embeddings REST adapter（记忆）
+│   ├── document-index.ts # 文档块 BM25 索引
+│   ├── document-vector.ts # 文档向量 collection 的 Qdrant adapter
+│   ├── builtin-store.ts  # PGlite + pgvector 内置结构化/向量存储（派生索引）
+│   ├── api-config.ts     # apiConfigPath 热编辑端点配置、代理与脱敏状态
+│   ├── enterprise-rules-rag.ts # 只读、按 ruleSet 隔离的企业规则 RAG
+│   ├── embedding-client.ts # OpenAI-compatible embeddings REST 客户端
+│   ├── skill-format.ts   # Agent-Skill 校验与 Markdown 渲染
+│   └── distillation-llm.ts # LLM 蒸馏/整合 prompt 与解析
 └── python/
     ├── reasoning_memory.py # 稳定的 CLI worker 入口与兼容导出
     └── reasoning_memory_core/
@@ -545,8 +577,30 @@ reasoning-trajectory-memory/（本仓库根目录即 DSH 插件包）
         ├── distillation.py      # 成功策略/失败归因蒸馏
         ├── retrieval.py         # 多路融合、排序与正反配额
         ├── feedback.py          # 效用反馈计数
-        └── service.py           # Python 操作分发
+        ├── causal_utils.py      # 因果效用估计（分层 ATE/CATE、IPTW 稳健性）
+        ├── qprobability.py      # 多概率保持（叠加/干涉/退相干/坍缩）
+        ├── distill_causal.py    # 提炼侧因果 uplift 与写入门控
+        ├── doc_chunking.py      # 文档标题层级分块与链接结构
+        ├── doc_rag.py           # 文档检索、确定性查询展开与删除计划
+        ├── templates.py         # 策略模板库稳定门面（兼容导出）
+        ├── template_build.py    # 模板构建与内置种子
+        ├── template_classify.py # 7 类任务模式分类
+        ├── template_match.py    # 模板匹配评分与结构签名辅助
+        ├── template_mining.py   # 确定性模板挖掘
+        ├── template_plan.py     # 只读联合计划（plan_task）
+        ├── template_publish.py  # 模板发布校验与效用反馈
+        └── service.py           # Python operation 分发
 ```
+
+依赖方向（强制）：
+
+```
+index.ts（组合根）──> tools/*（工具层）──> runtime（依赖容器）
+runtime ──> capture / storage-layer / index-layer / skill-export
+工具层与上述各层 ──> config / types / helpers / python 桥 / domain schema 等无副作用共享模块
+```
+
+`tools/*` 之间禁止互相 import；共享逻辑下沉到 `runtime.ts`、独立 domain/索引模块或 Python 核心。工具层不直接持有层实现（存储/索引访问一律经 runtime），对层实现只允许 type-import，值依赖一律经 runtime。`index.ts` 是唯一组合根与工具注册点，不得在其他文件注册工具。该分层只拆分原 `src/index.ts` 单体，不改变既有 domain schema、Python 协议与工具输出契约；分层不变量由 `scripts/verify-structure.mjs`（`npm run verify:structure`）在 `npm test` 中强制校验。
 
 插件遵循 DSH bundle manifest（`dsh.bundle.patch`）并注册 `defineTool` 工具；Python worker 和 `reasoning_memory_core/` 模块随 npm 包分发，由 DSH Host 侧 TypeScript 入口调用。入口脚本保留稳定路径，算法按流程职责维护。它不是 FastAPI、MCP server 或独立应用。持久化使用 `ctx.storageDomain.open(spec)`，不直接访问底层 backend。
 
@@ -554,7 +608,7 @@ reasoning-trajectory-memory/（本仓库根目录即 DSH 插件包）
 
 实现按用户提出的“检索效率与前沿论文思路”扩展：TypeScript 对任务情境、推理教训、前提、动作和推理图标签建本地 BM25 倒排索引；可选 Qdrant HNSW 从配置的 OpenAI-compatible embedding endpoint 获取向量。两路按 outcome 各取候选，排除活动 `taskId`，候选并集交给 Python；Python 结合推理语义、动作结构和逻辑图做加权 RRF，再执行正反比例配额。RRF 权重和候选评分记录进入检索审计。Qdrant 只保存向量、ID、outcome、taskId、内容/模型配置哈希等 payload，不保存完整记忆文本；`storageDomain` 仍然是事实源。
 
-向量层默认关闭；启用后记忆语义文本和查询会被发送到配置的 embedding endpoint。启动索引回填在后台进行；回填时先走 BM25，DSH 记忆写入不等待向量 upsert。服务异常时降级到 BM25；BM25 没有候选时回退到全量 Python 排序。没有接入 cross-encoder 或时间检索通道，RRF/候选池权重仍需标注数据消融，不能将论文的质量结论外推为本插件结果。相关实现为 `src/search-text.ts`、`src/lexical-index.ts`、`src/vector-index.ts` 和 `python/reasoning_memory_core/retrieval.py`；本地测试位于 `.gitignore` 排除的 `test/`，不会进入 npm 包文件清单。
+向量层默认关闭；启用后记忆语义文本和查询会被发送到配置的 embedding endpoint。启动索引回填在后台进行；回填时先走 BM25，DSH 记忆写入不等待向量 upsert。服务异常时降级到 BM25；BM25 没有候选时回退到全量 Python 排序。没有接入 cross-encoder 或时间检索通道，RRF/候选池权重仍需标注数据消融，不能将论文的质量结论外推为本插件结果。相关实现为 `src/search-text.ts`、`src/lexical-index.ts`、`src/vector-index.ts`（由 `src/index-layer.ts` 接线）和 `python/reasoning_memory_core/retrieval.py`；本地测试位于 `test/`（Node `test/*.test.mjs` 与 Python `test/test_*.py`，随仓库提交、CI 必需），npm `files[]` 白名单不含测试目录，因此不会进入发货包。
 
 ### 15.4 2026-10-28 企业规则 RAG 实现补充
 

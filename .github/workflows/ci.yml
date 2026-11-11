@@ -31,6 +31,11 @@ jobs:
       - name: Build (TypeScript)
         run: npm run prepare
 
+      # Decoupling guard: the entry stays a composition root, tool modules stay
+      # independent of each other, and no source file re-becomes a monolith.
+      - name: Architecture invariants
+        run: npm run verify:structure
+
       - name: Python core tests
         run: npm run test:python
 
