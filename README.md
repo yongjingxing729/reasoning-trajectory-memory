@@ -108,6 +108,16 @@ v0.5.0 的效用反馈是**关联性**的（Beta 计数估计 P(成功|用过记
 - **审计**：检索结果逐候选带 `causalUplift/causalSamples/simpsonParadox/causalStrata/estimatorVersion`；`memory_query` 加 `include_causal` 可查因果统计摘要。
 - **诚实边界**：识别假设 5 条（可忽略性/SUTVA/处置良定义/结局良定义/verdict=代理标签）——仅控制在已观测混杂（任务模式/族/模型版本/检索意图/步骤位）下成立；因果结局用环境 outcome 而非自报 verdict；估计全部由确定性计数完成，不委托 LLM；因果分不进 RRF 权重与正反配额。论文依据见设计文档 §20 与 `docs/research-notes/06-causal-ai.md`。
 
+### 多概率保持引擎（v0.7.0）
+
+受量子力学概率与因果 AI 启发，把"Agent 壳子把概率模型坍缩为单一输出"作为待解决问题：开源中 Top-1→Top-3 准确率下降被归因于**过早坍缩丢失叠加信息**（LLM 本是概率模型，argmax 决策/单条注入却强制单一输出，不符合现实任务多值、可叠加、顺序相关的逻辑）。v0.7.0 在四层映射上落地**多概率保持**：
+
+- **叠加态而非单点**：候选（任务模式/模板/记忆）不再 argmax 坍缩为单点，而保持叠加态 `|ψ⟩=Σφ_i|i⟩`（振幅模长 = 检索/效用分归一化、相位 θ∈{0,π} = 因果 ATE 方向，MVP 只用实数）；概率按玻恩定则 `P(i)=|φ_i|²` 提取。
+- **干涉项承载组合效应**：两候选联合使用时 `P(i∨j)=r_i²+r_j²+2r_i r_j cos(θ_i−θ_j)`——同相建设性、反相破坏性；这正是边际 ATE 够不到的**交互效应**，也解释 ToE"朴素经验管理低于无经验基线"的破坏性干涉可能。
+- **延迟坍缩与显式测量**：把"取 top-k"从隐式坍缩变成显式、可审计、可再测量的操作（证据增量时 Lüders 部分测量）；坍缩推迟到最后一个负责任的时刻。
+- **退相干桥接 = 零回归**：`ρ→(1−rate)ρ+rate·diag(ρ)`，速率由有效样本量驱动；**完全退相干极限即 v0.6.0 因果引擎行为**，`quantumDecisionEnabled=false`（默认）时与 v0.6.0 逐字节一致。
+- **诚实边界**：不涉量子计算/硬件、不称模型内部为量子系统、不做量子因果模型、线上不采样（Self-Consistency 式采样仅离线消融）、干涉/相位不进 RRF 权重与正反配额（只作用于最终 multiplier、封顶 ±20%）。设计依据见设计文档 §21 与 `docs/research-notes/07-quantum-probability.md`；具体函数实现后续 `spec-0.7.0` 开发。
+
 ### 混合检索与可选向量索引
 
 - 本地 BM25 倒排索引索引推理教训、任务情境、前提、工具动作和图标签；中文按单字/二元组匹配，英文及数字按词项匹配。成功和失败分别取 Top-N，默认各 100 条。
@@ -235,6 +245,8 @@ v0.4.0 的策略模板库与激活动作化依据《面向 LLM 智能体的推�
 v0.5.0 的推理检索 RAG 依据 8 篇前沿论文（完整映射与越界声明见设计文档 §19 与 `docs/research-notes/05-reasoning-rag.md`，数字均经 arXiv 摘要复核）：Self-RAG（arXiv:2310.11511，按需检索→模板步骤 `retrieve_document` 声明式近似）、RAPTOR（arXiv:2401.18059，多层表示→标题层级分块，QuALITY +20% 依赖 LLM 摘要层故不复制）、GraphRAG（arXiv:2404.16130，全局总结越界）、HippoRAG（arXiv:2405.14831，图扩散单步→有界 BFS 多跳）、Step-Back（arXiv:2310.06117，抽象改写→确定性词表泛化）、HyDE（arXiv:2212.10496，查询展开）、Adaptive-RAG（arXiv:2403.14403，路由→模块需求声明）、IRCoT（arXiv:2212.10509，多跳检索价值）。
 
 v0.6.0 的因果效用引擎依据因果 AI 文献（完整公式、识别假设与越界声明见设计文档 §20 与 `docs/research-notes/06-causal-ai.md`）：Pearl 因果层级/后门准则/do-calculus（经典，非 arXiv）；COMA（arXiv:1705.08926，反事实基线的配对续写出处）；ProactAgent（arXiv:2604.20572，paired continuations 过程奖励）；Egami（arXiv:1802.02163 文本因果识别问题；arXiv:2306.04746——自报 verdict 是代理标签，替代准确率 80–90% 仍有实质偏差 → 必须收缩）；Schölkopf（arXiv:2102.11107，因果表示学习越界声明）；Kıcıman（arXiv:2305.00050，"LLMs ignore the actual data" → 估计不委托 LLM）；Jin（arXiv:2306.05836，LLM 纯因果推断近随机）；Karimi（arXiv:2002.06278，反事实解释≠干预建议）；Retroformer（arXiv:2308.02151，梯度式优化越界）。
+
+v0.7.0 的多概率保持引擎依据量子概率（作为经典概率的推广形式语言，非量子计算）与多路径采样的经典先驱（完整公式、识别假设与越界声明见设计文档 §21 与 `docs/research-notes/07-quantum-probability.md`）：Busemeyer/Pothos 等的量子认知（Psychological Review 118(2) 2011 干涉项解释合取谬误/析取效应；BBS 36 2013 纲领；《Quantum Models of Cognition and Decision》2012 /《Ubiquitous Quantum Structure》2010 专著；顺序效应模型 Topics in Cognitive Science 2013）——干涉项与顺序效应（非对易测量）的形式来源；Self-Consistency（arXiv:2203.11171，多路径采样边缘化优于单条贪心解码 = "保持多概率优于单点坍缩"的经典证据）；Tree of Thoughts（arXiv:2305.10601，多路径搜索）；LLM 选项顺序敏感性（arXiv:2308.11483，顺序对称被违反的经验证据）。"因果 × 量子"（Costa & Shrapnel 2016 / Allen et al. 2017）为相邻领域背景指针、不落地。
 
 - Ouyang et al., [ReasoningBank: Scaling Agent Self-Evolving with Reasoning Memory](https://arxiv.org/abs/2509.25140), ICLR 2026。
 - 官方实现：[google-research/reasoning-bank](https://github.com/google-research/reasoning-bank)。该仓库提供 SWE-Bench 与 WebArena 实验代码；本插件复用其成功/失败经验蒸馏、检索、回写的核心框架思想，不复制其 benchmark harness。

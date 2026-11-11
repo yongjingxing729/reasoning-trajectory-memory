@@ -395,3 +395,50 @@ CAUSAL_MULTIPLIER_CAP = 0.20
 MAX_CAUSAL_EVENTS_PER_UNIT = 200
 
 MAX_CAUSAL_EVENTS_PER_TASK = 100
+
+# ---------------------------------------------------------------------------
+# v0.7.0 quantum multi-probability engine (final spec 0.7.0). Real amplitudes
+# (phase {0, pi}), deterministic linear algebra, no random/numpy. The quantum
+# path only runs when quantumDecisionEnabled is true; off = v0.6.0 verbatim.
+# ---------------------------------------------------------------------------
+
+QUANTUM_ESTIMATOR_VERSION = "dsh-reasoning-memory/quantum-1"
+
+# Superposition size cap: beyond this the state is explicitly collapsed
+# (collapseReason='rank_cutoff') before being emitted.
+MAX_SUPERPOSITION_SIZE = 3
+
+# The interference correction enters the final multiplier only, capped to the
+# same [0.8, 1.2] band as the v0.6.0 causal multiplier.
+INTERFERENCE_CAP = 0.20
+
+# Automatic decoherence rate k/(n_eff + k): reuse the v0.6.0 shrinkage prior.
+DECOHERENCE_PRIOR = 20
+
+# Quantum collapse audit FIFO caps (mirror the v0.6.0 causal event caps).
+MAX_QUANTUM_EVENTS = 2000
+
+MAX_QUANTUM_EVENTS_PER_RETRIEVAL = 4
+
+# ---------------------------------------------------------------------------
+# v0.8.0 causal distillation uplift (final spec 0.8.0). Pure integer counting
+# plus deterministic arithmetic; the uplift is the incremental contribution of
+# distilling one candidate over the inherited utility of the existing bank. It
+# only gates/weights/phases NEW writes (never deletes), reusing the v0.6.0
+# stratification + shrinkage + Simpson machinery on the do(distill) treatment.
+# ---------------------------------------------------------------------------
+
+DISTILL_ESTIMATOR_VERSION = "dsh-reasoning-memory/distill-causal-1"
+
+# The distill uplift is bounded to the same [0.8, 1.2] band as the causal and
+# Beta multipliers: never more aggressive than status quo.
+DISTILL_UPLIFT_CAP = 0.20
+
+# Empirical-Bayes-style shrinkage prior: uplift x n_eff/(n_eff + prior).
+DISTILL_SHRINK_PRIOR = 20
+
+# Strata need at least this many samples in EACH arm to enter the estimate.
+DISTILL_MIN_ARM_SAMPLES = 5
+
+# Distill causal event FIFO cap per memory unit.
+MAX_DISTILL_EVENTS_PER_UNIT = 200

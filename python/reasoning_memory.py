@@ -22,9 +22,22 @@ from reasoning_memory_core import handle_request
 from reasoning_memory_core.causal_utils import batch_causal_estimates, causal_estimate
 from reasoning_memory_core.constants import *  # noqa: F403
 from reasoning_memory_core.distillation import _make_memory
+from reasoning_memory_core.distill_causal import (
+    estimate_distill_uplift,
+    gate_distill,
+    inherited_utility,
+    phase_from_uplift,
+)
 from reasoning_memory_core.doc_chunking import chunk_document
 from reasoning_memory_core.doc_rag import delete_document_plan, retrieve_document
 from reasoning_memory_core.feedback import _record_feedback
+from reasoning_memory_core.qprobability import (
+    build_superposition,
+    coherence,
+    decoherence,
+    interference_pair,
+    luders_update,
+)
 from reasoning_memory_core.reasoning_graph import (
     _fallback_reasoning_graph,
     _parse_reasoning_graph,

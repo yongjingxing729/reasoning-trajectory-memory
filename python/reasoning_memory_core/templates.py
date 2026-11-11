@@ -24,6 +24,7 @@ from .constants import (
     CLUSTER_FORM_SIMILARITY,
     CLUSTER_JOIN_SIMILARITY,
     MAX_MODULE_DEMANDS_PER_STEP,
+    MAX_SUPERPOSITION_SIZE,
     MAX_TEMPLATE_DESCRIPTION_CHARS,
     MAX_TEMPLATE_INTENT_CHARS,
     MAX_TEMPLATE_NAME_CHARS,
@@ -47,6 +48,7 @@ from .constants import (
     TEMPLATE_MATCH_MIN,
     TEMPLATE_MATCH_STRONG,
 )
+from .qprobability import build_superposition
 from .text_similarity import _clean_text, semantic_similarity, sequence_similarity
 from .trajectory import structure_signature
 
@@ -493,6 +495,10 @@ def plan_task(
     templates: list[dict[str, Any]] | None = None,
     max_templates: int = 2,
     template_match_min: float = TEMPLATE_MATCH_MIN,
+    quantum_decision_enabled: bool = False,
+    max_superposition_size: int = MAX_SUPERPOSITION_SIZE,
+    phase_from_causal: bool = True,
+    decoherence_rate: float = 0.0,
 ) -> dict[str, Any]:
     """Read-only joint decision: classify the task and match templates."""
     raw_events = events if isinstance(events, list) else []
@@ -572,7 +578,7 @@ def plan_task(
             "Treat template steps as guidance; verify each result in the current environment."
         )
 
-    return {
+    result: dict[str, Any] = {
         "pattern": pattern,
         "confidence": classification["confidence"],
         "evidence": classification["evidence"],
@@ -586,6 +592,37 @@ def plan_task(
             "querySignature": signature,
         },
     }
+
+    # v0.7.0 additive template superposition (deferred collapse). Templates
+    # carry no retrieval-side causal phase in the MVP, so their phase is 0.
+    if quantum_decision_enabled:
+        size = max(1, min(MAX_SUPERPOSITION_SIZE, int(max_superposition_size)))
+        template_candidates = [
+            {"id": str(template.get("templateId", "")), "amplitude": float(template.get("score", 0.0) or 0.0), "phase": 0.0}
+            for template in top
+        ]
+        full = build_superposition(candidates=template_candidates)
+        collapse_reason = ""
+        coherence_before = full["coherence"]
+        if len(template_candidates) > size:
+            collapse_reason = "rank_cutoff"
+            collapsed = build_superposition(candidates=template_candidates[:size])
+            superposition = collapsed["superposition"]
+            coherence_after = collapsed["coherence"]
+        else:
+            superposition = full["superposition"]
+            coherence_after = full["coherence"]
+        for entry in superposition:
+            entry["collapseReason"] = collapse_reason
+        result["superposition"] = superposition
+        result["quantum"] = {
+            "coherence": coherence_after,
+            "coherenceBefore": coherence_before,
+            "coherenceAfter": coherence_after,
+            "collapseReason": collapse_reason,
+            "estimatorVersion": full["estimatorVersion"],
+        }
+    return result
 
 
 def mine_templates(

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .causal_utils import batch_causal_estimates, causal_estimate
-from .constants import TEMPLATE_MATCH_MIN
+from .constants import MAX_SUPERPOSITION_SIZE, TEMPLATE_MATCH_MIN
 from .distillation import _make_memory
 from .doc_chunking import chunk_document
 from .doc_rag import delete_document_plan, retrieve_document
@@ -68,6 +68,10 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any]:
             templates=_as_list(request, "templates"),
             max_templates=request.get("maxTemplates", 2),
             template_match_min=request.get("templateMatchMin", TEMPLATE_MATCH_MIN),
+            quantum_decision_enabled=bool(request.get("quantumDecisionEnabled", False)),
+            max_superposition_size=request.get("maxSuperpositionSize", MAX_SUPERPOSITION_SIZE),
+            phase_from_causal=bool(request.get("phaseFromCausal", True)),
+            decoherence_rate=request.get("decoherenceRate", 0.0),
         )
     if operation == "mine_templates":
         return mine_templates(

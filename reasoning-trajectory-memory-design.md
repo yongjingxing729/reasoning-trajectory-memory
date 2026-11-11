@@ -105,6 +105,22 @@ DSH 插件生态已有多个面向"记忆"的开源插件。它们与本项目�
 
 ---
 
+### 1.8 迭代版本总览（v0.4.0 → v0.8.0）
+
+主开发文档自 §18 起按迭代记录落地进度；下表为总览（对应设计细节见各节，完整规格与论文依据见 `docs/spec-0.X.0.md` 与 `docs/research-notes/0X-*.md`）：
+
+| 版本 | 日期 | 主题 | 概率视角 | 四层映射新增 | 文档落点 |
+|---|---|---|---|---|---|
+| v0.4.0 | 2026-11-02 | 四层映射骨架落地（策略模板 + 激活动作化） | 经典关联（Beta 计数） | L1 模式分类 / L2 模板 / L3 元数据 / L4 激活计划 | §18、spec-0.4.0、01–04 |
+| v0.5.0 | 2026-11-04 | 推理检索 RAG（文档检索） | 经典关联 | L1 模式过滤 / L2 `retrieve_document` / L3 文档域 / L4 步骤对齐检索 | §19、spec-0.5.0、05 |
+| v0.6.0 | 2026-11-06 | 因果效用引擎（关联 → 因果） | 因果（do-演算）ATE | L1 混杂分层 / L2 处置 / L3 causalMeta / L4 do(retrieve)+反事实 | §20、spec-0.6.0、06 |
+| **v0.7.0** | 2026-11-09 | **多概率保持引擎（单点坍缩 → 叠加保持）** | **量子（干涉 + 顺序）** | **L1 模式叠加 / L2 模板叠加+干涉 / L3 振幅+相位 / L4 延迟坍缩** | **§21、07** |
+| **v0.8.0** | 2026-11-11 | **因果因子驱动的任务提炼（提炼侧因果信用分配）** | **因果（do-演算）uplift + 量子相位写入** | **L1 混杂分层 / L2 模板蒸馏处置 / L3 distillCausalMeta / L4 do(distill)+restored-state 反事实** | **§23、08** |
+
+概率视角逐级推广：经典 ⊂ 因果 ⊂ 量子；每一级是前一级的推广（v0.6.0 = v0.7.0 的完全退相干极限），故逐版本保持零回归。v0.8.0 不引入新的概率层级，而是把因果（do(distill) 的 uplift）与量子（写时定相）**前移到提炼侧**（写路径），检索侧 v0.6.0/v0.7.0 逻辑不变。v0.7.0 的 `spec-0.7.0`（函数级实现）按计划后续开发。
+
+---
+
 ## 2. 总体架构
 
 ### 2.1 架构（DSH 插件视角）
@@ -442,6 +458,8 @@ PRM 只在校准过的领域辅助评估；代码任务优先用执行测试与�
 - harness 固定模型、工具、提示词、预算、任务顺序和结果记录；在 pilot 之后、正式实验前冻结版本；
 - M6 只汇总预先登记的主假设实验和有限消融，不追加大规模新基准与全组合搜索。
 
+> **迭代期分工映射（2026-11-09 补）**：M1–M6 为原始主线规划；自 v0.4.0 起工程按迭代推进（§18–§21），每迭代由 spec 明示角色——code-developer（实现，对应 P2）、deep-researcher（技术调研与文献/数字复核，对应 P3 主研究）、debugger（基线/对抗测试与零回归校验，对应 P4）、watcher（构建/测试监听）、lead（架构与文档，对应 P1）。v0.6.0 因果引擎与 v0.7.0 多概率引擎是 P3 主研究线在"概率视角"维度的深化（关联→因果→量子），其反事实/干涉/顺序效应评测归入 P4 的 `scripts/eval`。
+
 ---
 
 ## 13. 里程碑
@@ -734,6 +752,247 @@ v0.5.0 的效用反馈是**关联性**的：`0.8 + 0.4×(helpful+1)/(helpful+har
 
 ---
 
+## 21. 多概率保持引擎落地（2026-11-09 迭代，v0.7.0）
+
+### 21.1 诊断：从"单点坍缩"到"多概率保持"（量子概率视角）
+
+**现象（用户命题，需受控测量）**：开源中观察到"Top-1 到 Top-3 的准确率下降"——即**把前 3 候选注入 Agent 上下文时，下游任务准确率反而不及只注入 Top-1**。这里必须区分两种"准确率"：**覆盖精度** Acc@k（正确项是否落在前 k）随 k 单调不减，不是本命题所指；本命题指的是**承诺/注入精度**——把更多候选放进上下文后模型的最终输出质量反而下降。经典"可加、顺序对称"的概率模型无法解释"候选更多反而更差"，唯一出路是**候选间存在干涉 / 上下文污染 / 顺序效应**——这正是量子概率的领域。
+
+**可证伪的操作化定义（H-Q1）**：固定模型/工具/提示词/预算与 held-out 任务集，比较 (a) 只注入 top-1 候选 vs (b) 注入 top-k 候选（保留振幅/相位/顺序元数据）的下游成功率。若 (b) 显著低于 (a)（候选更多反而更差），且该差异随候选顺序置换而显著变化，则经典可加-顺序对称模型被违反，构成"多概率保持 + 干涉建模"介入的必要条件；反之（(b) ≥ (a) 且顺序无关）则 H-Q1 被否证、本引擎无增量。评测由 `scripts/eval` 的坍缩损失 / 顺序效应 / 干涉三组受控测量执行（07 研究 §6）。
+
+**归因（本迭代的立场）**：LLM 本质是**概率模型**（在候选上输出分布），但 Agent 的"壳子"——工具编排、argmax 决策、单条注入——把它**坍缩为单一输出**。这一步坍缩丢弃了分布中承载的信息，且不符合现实世界"任务本身多值、可叠加、顺序相关"的逻辑。这与量子力学里"叠加态在测量时坍缩为单一本征态"同构：测量（坍缩）不可逆地丢失叠加信息。
+
+**三级概率推进（诚实定位）**：
+
+| 迭代 | 概率视角 | 回答的问题 |
+|---|---|---|
+| v0.5.0 | 经典（Kolmogorov）关联 | 相关 vs 不相关 |
+| v0.6.0 | 因果（do-演算）干预 | 相关 ≠ 因果（混杂/辛普森） |
+| **v0.7.0** | **量子（广义概率论）** | **组合效应为何 ≠ 边际和；过早坍缩丢了什么；顺序为何是处置变量** |
+
+三者**逐级推广而非替代**：经典 ⊂ 因果 ⊂ 量子。v0.6.0 因果引擎是 v0.7.0 的**「完全退相干极限」**——当干涉项为 0、相位被抹平，量子引擎严格退化为因果引擎行为，从结构上保证零回归。
+
+### 21.2 核心机制（三原语 + 退相干桥接）
+
+- **叠加态表示（一等数据表示）**：候选（任务模式/模板/记忆）不再被 argmax 坍缩为单点，而是保持叠加态 `|ψ⟩ = Σ_i φ_i|i⟩`，振幅 `φ_i = r_i·e^{iθ_i}`；模长 `r_i` 来自既有检索/匹配/效用分归一化，相位 `θ_i ∈ {0, π}` 来自因果效应方向（§21.4）。概率由玻恩定则提取 `P(i)=|φ_i|²`。**MVP 只用实数振幅（相位 {0,π}），纯标准库可算。**
+- **干涉项（组合效应的一等载体）**：把候选 i、j **相干叠加**（振幅相加而非概率相加）时，组合振幅平方 `|φ_i + φ_j|² = r_i² + r_j² + 2·r_i·r_j·cos(θ_i−θ_j)`。经典（非相干）融合只加概率 `r_i² + r_j²`（RRF 通道融合正是如此），量子叠加多出的交叉项 `2·r_i·r_j·cos(θ_i−θ_j)` 即**干涉项**：同相（θ_i=θ_j）→ 建设性（组合强于边际和）；反相（θ_i=0, θ_j=π）→ 破坏性（组合弱于边际和）。这一交叉项正是 v0.6.0 边际 ATE 够不到的**交互效应（effect modification）**，也解释了 ToE"朴素经验管理低于无经验基线"的破坏性干涉可能。**符号约定（裁决 Q6）**："建设性/破坏性"指"组合振幅平方相对边际和的偏离方向"，**不指"更接近/远离成功"**；接近成功与否由相位本身承载（θ=0 正向、θ=π 负向）。双负（θ_i=θ_j=π）相干 → 交叉项为正，正确解读是"两个负振幅相干后组合更负、**偏离成功更远**"，而非"更有用"。
+- **延迟坍缩与显式测量**：检索—融合—排序后"取 top-k"是一次隐式坍缩。本引擎把它变成显式、可审计、可再测量的操作——把坍缩推迟到最后一个负责任的时刻，证据增量时用**部分测量（Lüders 更新）**保留未观测子空间的相干。
+- **退相干桥接（零回归的机制化）**：`ρ → (1−rate)·ρ + rate·diag(ρ)`，退相干速率由有效样本量驱动（`rate = k/(n_eff+k)`，复用 v0.6.0 收缩先验）。样本不足 → 相位/干涉被抹平 → 退化为经典-因果路径。**完全退相干 = v0.6.0 行为**。**开关语义（裁决 Q1）**：自动退相干是量子路径的固有组成部分，仅在 `quantumDecisionEnabled=true` 时求值；开关关闭时**完全跳过量子路径、不做任何退相干计算**，故输出与 v0.6.0 逐字节一致。配置 `decoherenceRate`（默认 0）是叠加在自动速率之上的**手动偏置**（0 = 不加额外退相干），与自动速率取和后 clip 到 [0,1]。
+
+### 21.3 四层映射的量子化落地
+
+| 层 | v0.6.0 现状 | v0.7.0 量子落点 |
+|---|---|---|
+| L1 任务模式 | argmax → 单类 + 置信度/边际 | **叠加态**：输出 7 类概率（振幅）向量而非单一类；`confidence/margin` 升级为振幅；仅在需单一模式的动作点"测量" |
+| L2 策略模板 | argmax match → 单模板注入 | **模板叠加 + 干涉**：top-k 模板以振幅并存；结构重叠模板产生干涉项 |
+| L3 能力模块 | Beta 效用 + causalMeta（ATE 幅度） | **振幅（模长）+ 相位**：模长 = 效用幅度、相位 = ATE 符号；密度矩阵非对角元 = 模块间相干 |
+| L4 激活动作 | 排序 → 注入 top-k（隐式坍缩） | **延迟坍缩 + 显式测量 + 再测量**：注入带振幅/相位的叠加分布；坍缩推迟到最终承诺点 |
+
+### 21.4 与因果效用引擎（v0.6.0）的交融
+
+相位把两条线**焊在一起**：v0.6.0 的 ATE 符号 → v0.7.0 的相位（正效应 θ=0、负效应 θ=π），因果方向决定干涉是建设还是破坏。**该映射是编码约定（可替换）**：相位 θ∈{0,π} 承载"该单元对成功振幅的贡献方向"，而 ATE 符号是去混杂后该贡献方向的可观测代理；相位也可取更细粒度或由其他可观测因果量导出，但 MVP 锁定 {0,π} 以保确定性、可审计、零回归。一句话分工：**v0.6.0 回答"使用 m 是否导致成功"（边际因果）；v0.7.0 回答"把多条候选放在一起时，组合效应为何不等于边际和，以及过早坍缩丢掉了什么"（干涉 + 顺序）。** 相位与干涉的识别假设沿用 06（可忽略性/SUTVA/处置与结局良定义/verdict=代理标签），并新增 5 条（§21.6）。
+
+### 21.5 数据模型（additive，零回归）
+
+- 新独立 domain `reasoning_memory_quantum`（version 1，与 `reasoning_memory_causal` 并列）：存叠加态/坍缩审计记录（候选振幅与相位、密度矩阵摘要、`coherence`、`collapseReason`、`coherenceBefore/After`、`estimatorVersion`；FIFO 上限）。
+- 候选审计 additive 字段：`amplitude: number default 0`、`phase: number default 0`、`interferenceDelta: number default 0`、`coherence: number default 0`、`collapseReason: string default ''`（全部带默认值，不破坏旧介质）。
+- Python 新模块 `qprobability.py`（纯 stdlib、实数域、确定性）：`build_superposition` / `interference_pair` / `luders_update` / `coherence` / `decoherence`（设计级要点见 `docs/research-notes/07-quantum-probability.md` §3，函数签名与常量后续 `spec-0.7.0` 定稿）。
+- 配置（additive，默认关闭）：`quantumDecisionEnabled`（默认 false）、`maxSuperpositionSize`（默认 3）、`phaseFromCausal`（默认 true）、`decoherenceRate`（默认 0）。
+- **多概率消费格式（一等契约）**：`quantumDecisionEnabled=true` 时，`memory_retrieve`/`memory_plan_task` 除传统 `top-k` 摘要外附带 `superposition[]` 字段——每条候选 `{id, amplitude r, phase θ, p=|φ|², interferenceDelta, coherence}`，并**保留候选顺序语义（顺序即处置变量）**。下游模型在最后一个承诺点之前按该分布推理，而非在检索时被迫坍缩；坍缩点由插件审计（`collapseReason`/`coherenceBefore/After`）。**契约裁决（Q3/Q4）**：开关关闭时 `superposition` 字段**完全缺席**（`"superposition" not in result`，非空数组），保证与 v0.6.0 输出字典结构逐字节一致；`interferenceDelta` 审计**同时存原始值 `interferenceDeltaRaw` 与封顶后值 `interferenceDelta`**（原始值供"每个估计量可拆解"，封顶值进最终 multiplier，二者分离）。
+
+### 21.6 诚实边界与越界声明
+
+识别假设 5 条（`07-quantum-probability.md` §0 原样）：多概率保持是**决策框架假设非模型本体假设**；相位来源 = 可观测因果方向；干涉以环境 outcome 为锚（**合成 gold 只验证机制算术、不验证真实联合因果**——真实集靠配对/组合实验逐步积累，诚实标注，见 test-plan §7 Q2）；坍缩是不可逆信息丢失边界；确定性优先。
+
+越界（不做什么）：
+
+1. **不涉及量子计算/量子硬件**：无 qubit、无量子电路、MVP 不用复数（实数振幅即可）；"量子"仅指概率论形式语言。
+2. **不声称模型内部是量子系统**：叠加态是插件决策框架的数据表示，不观测、不干预模型内部。
+3. **不做量子因果结构发现/量子因果模型**（Costa & Shrapnel / Allen et al. 已复核 NJP 18:063032 / PRX 7:031021，仍仅作背景指针、不落地）；
+4. **不采样做线上 Self-Consistency**（采样 = 显式随机，仅离线消融，固定 seed）；
+5. **不把干涉/相位进 RRF 通道权重与正反配额**（沿用 v0.6.0 硬边界：只作用于最终 multiplier、封顶 ±20%、负效应只压低不删除）；
+6. **不生成"量子/坍缩"的解释性文本给模型**（审计输出 = 数值表，与 06"不生成反事实叙述"同款纪律）。
+7. **不承诺下游遵守注入顺序**（裁决 Q5）：插件保证 `superposition[]` 输出有序并审计顺序，但不保证下游 Agent 按给定顺序推理——"顺序作为处置变量"的端到端可审计性仅插件侧成立。
+
+完整公式与文献依据见 `docs/research-notes/07-quantum-probability.md`；对抗性测试清单见 `docs/test-plan-0.7.0.md`（六组 32 用例；其 §7 设计疑点 Q1–Q6 已于本节裁决落笔）；具体函数/实现细节后续 `spec-0.7.0` 开发（本设计文档为最终确定的主开发文档）。
+
+### 21.7 术语速查（量子概率在本插件中的工程含义）
+
+下表固定量子概率术语在**本插件决策框架**中的含义（与物理含义划清界限，见 §21.6 越界 1/2）：
+
+| 术语 | 工程含义 | 落点 |
+|---|---|---|
+| 叠加态 \|ψ⟩ | 多候选并存、不坍缩为单点的决策表示 | `memory_retrieve`/`memory_plan_task` 输出 |
+| 振幅 φ = r·e^{iθ} | 模长 r = 效用/相关幅度；相位 θ = 因果方向（{0,π}） | L3 模块、候选审计 |
+| 玻恩定则 P(i)=\|φ_i\|² | 由振幅提取"被采用"的概率（归一化） | 叠加态归一化/审计 |
+| 干涉项 `2r_i r_j cos(θ_i−θ_j)` | 相干叠加相对概率相加的**偏离**；建设/破坏指"组合强于/弱于边际和"，成功方向由相位承载 | L2 模板对 / L4 注入对 |
+| 测量/坍缩 | 把叠加态固定为单一输出的不可逆操作 | L4 "取 top-k" / 最终承诺点 |
+| 部分测量（Lüders） | 证据增量时更新态、保留未观测相干 | 步骤级再检索 |
+| 密度矩阵 ρ | 态的一等表示；非对角元 = 相干 | `reasoning_memory_quantum` |
+| 退相干 | 干涉/相位被抹平 → 退化为经典-因果路径 | 样本不足自动回退 |
+
+---
+
+## 22. 前沿思路来源与后续方向（2026-11-09 检索）
+
+### 22.1 定位
+
+在落地 v0.7.0 时同步检索 2025–2026 前沿工作，作为**思路来源**——不新增运行时依赖、不立即落地，用途有三：① 佐证"量子叠加 + 延迟坍缩"不是孤例，而是正在成形的研究脉络；② 为 §21 的相位识别、顺序效应、上下文依赖提供更锋利的表述；③ 标注 v0.8.0 候选方向。三篇均经 `web_fetch` 复核 arXiv 摘要页（2026-11-09，HTTP 200）。
+
+### 22.2 三篇已核实的前沿论文
+
+| 论文 | 主题 | 与本项目的直接关联 |
+|---|---|---|
+| Quantum Abduction: A New Paradigm for Reasoning under Uncertainty（arXiv:2509.16958，Pareschi 2025） | 假设以叠加态并存、建设/破坏性干涉、仅在证据相干时坍缩，反对"消元式搜索"的过早剪枝 | **v0.7.0 的近亲**：suspension = 延迟坍缩；interference = 干涉项；"dynamic synthesis over premature elimination" = 反对 argmax 单点坍缩 |
+| From Reasoning to Agentic: Credit Assignment in RL for LLMs（arXiv:2604.09459，Zhang 2026，69 篇综述） | 稀疏结局奖励下的信用分配；"text-only histories can leave even the sign of credit unidentified"；restored-state 对照识别协议特定因果对比；CA-ID Card | **v0.6.0/v0.7.0 的相位地基**：ATE 符号 = 相位，而符号本身在纯文本历史下可能不可识别 → 必须反事实对 + 收缩 |
+| Contextual Relevance and Adaptive Sampling for LLM-Based Document Reranking（arXiv:2511.01208，Huang et al. 2025） | 相关度 = 对候选集合与呈现顺序的上下文边缘化；位置偏差 + 批次组成偏差 | **顺序即处置变量 + 干涉项**的检索侧独立证据；"uncertainty-aware sampling" 对应离线 Self-Consistency 消融 |
+
+### 22.3 对本设计的直接启示（交融）
+
+1. **延迟坍缩是共识**：Quantum Abduction 的 "sustain multiple explanatory lines in suspension … collapse only when coherence with evidence is reached" 与 §21.2"把坍缩推迟到最后一个负责任的时刻"逐句对应——本插件的工程近似（实数振幅、确定性）可视为其"量子认知 + NLP 嵌入"路线的最小确定性版。
+2. **相位符号可能不可识别（关键诚实话）**：Credit Assignment 综述指出"text-only histories can leave even the sign of credit unidentified"——§21.4 的相位 θ∈{0,π} 依赖 ATE 符号，而该符号在纯文本历史下可能本身不可识别。这**强化**了 §21.6 的收缩 + 退相干回退：相位符号只在 restored-state 反事实对 / 分层达标时启用，否则抹平为 0（退相干），与综述的"restored-state comparisons identify a protocol-specific causal contrast"一致。其 **CA-ID Card**（每条声明链到 estimand + evidence provenance + falsification test）可作为候选审计字段蓝本。
+3. **上下文相关效用**：Contextual Relevance 的 "relevance marginalized over the distribution of … candidate set composition and presentation order" 与 §21"顺序即处置变量 + 干涉项"是同一思想的两个侧面——一个在检索侧、一个在激活侧。其 "uncertainty-aware sampling" 可作为 §21.5 离线 Self-Consistency 式消融的对照方法。
+
+### 22.4 v0.8.0 候选方向（诚实标注，不承诺）
+
+1. **相位细粒度化**：由 {0,π} 扩展到连续相位或复振幅（Quantum Abduction 用 NLP 嵌入构造振幅/相位），仅在反事实对充足时启用，仍受收缩与封顶约束。
+2. **上下文相关效用（contextual relevance）**：把 L3 效用从"边际"扩展为"对候选集合/顺序的条件期望"，与干涉项统一在同一形式化下。
+3. **CA-ID Card 式审计**：候选审计新增 `estimand` / `evidenceProvenance` / `falsificationTest`，把每条因果/相位声明链到可证伪性。
+
+### 22.5 复核记录
+
+| arXiv | 题名 | 复核状态 |
+|---|---|---|
+| 2509.16958 | Quantum Abduction（Pareschi 2025） | ✅ web_fetch 摘要页（2026-11-09） |
+| 2604.09459 | Credit Assignment in RL for LLMs（Zhang 2026） | ✅ web_fetch 摘要页（2026-11-09） |
+| 2511.01208 | Contextual Relevance and Adaptive Sampling（Huang et al. 2025） | ✅ web_fetch 摘要页（2026-11-09） |
+
+---
+
+## 23. 因果因子驱动的任务提炼（2026-11-11 迭代，v0.8.0）
+
+### 23.1 诊断：从"关联性提炼"到"因果提炼"，以及"继承效用"污染
+
+v0.4.0 起，任务提炼（`memory_save_outcome` → 蒸馏 → MemoryItem）一直由**关联性信号**驱动：
+
+- helpful/harmful Beta 计数（`0.8 + 0.4×(helpful+1)/(helpful+harmful+2)`）回答"该记忆与成功**相关**吗"；
+- `insightConfidence` 是调用者/LLM 蒸馏时的**自评**（spec-0.4.0 §3.5 门控，写入策略而非校准质量判定）。
+
+两者都不回答"提炼这条记忆是否**导致**下游更好"。更尖锐的是**继承效用（inherited utility）污染**（MGPO 教训，08 研究 §1）：一条候选条目的**表观效用**（写它之后库的性能）可能**继承自库中已有信息**，而不是它自身的贡献——
+
+```
+apparent(m)    = E[Y | 库 = M ∪ {m}]   # 表观效用：写 m 后的库性能
+inherited(m)   = E[Y | 库 = M]         # 继承效用：不写 m、仅靠已有库 M\m
+incremental(m) = apparent(m) − inherited(m)   # 增量贡献 = 奇妙因子
+```
+
+典型污染：m 与已有条目 m' 近似重复，成功本来就会发生，写 m 不带来任何增量（`incremental(m) ≈ 0`），却把 `apparent(m)` 的高值误记为 m 的功劳，导致记忆库膨胀（MGPO：平均记忆长度相对优化前降低近 80% 的冗余即此类）却不提升效果。
+
+v0.6.0 已在**检索侧**用 do(retrieve) 的 ATE 做因果信用分配；本迭代把它**前移到提炼侧**——用 do(distill) 的增量因果贡献作为提炼决策的一等信号。一句话：**先因果地决定记住什么，再因果地决定检索什么**（§22 的 Credit Assignment 综述教训 2604.09459 在提炼侧的直接落地；§22.4 候选方向中的"CA-ID Card 式审计"并入本节 §23.5 元数据）。
+
+### 23.2 奇妙因子形式化：增量因果贡献 uplift(m)
+
+**定义（提炼侧处理效应）**：
+
+```
+uplift(m) = E[Y | do(distill m)] − E[Y | do(¬distill m)]
+          = incremental(m) = apparent(m) − inherited(m)
+```
+
+- `do(distill m)`：把候选条目 m 写入记忆库（库 M → M∪{m}）的干预；
+- `do(¬distill m)`：不写 m（库保持 M）的反事实；
+- `Y`：下游任务流结局（任务成功率 / 步骤级结局，与 v0.6.0 同源；**不用 verdict 当结局**，verdict 是代理标签）。
+
+**增量贡献分离（反事实要点）**：`uplift(m)` 不是"写 m 之后库有多好"（表观），而是"写 m 相对不写 m 多带来多少"（增量）。后者要求固定除"是否写 m"以外的一切——尤其固定库中**其余条目**，这正是 MGPO 把"继承自已存信息的效用"隔离出来的反事实操作。
+
+**配对 rollout 估计（TQG-Exp 估计思想，08 研究 §2）**：
+
+```
+uplift_hat(m) = mean_{paired}( Y_{with m} − Y_{without m} )
+```
+
+同一下游任务（或同任务流前缀），库状态只差"是否含 m"，前缀/模型/工具/库中其余条目全部固定；"without m"臂即 restored-state 式反事实（把库恢复到写 m 之前再跑）。这是 do(distill) 最接近 L3 反事实层的 gold 证据（COMA 反事实基线的提炼侧对应）。
+
+**观察性分层估计（线上低成本近似）**：按 L1 任务模式分层，每层 s 做 2×2 表（Laplace 平滑），`uplift_s = ŷ_{1s} − ŷ_{0s}`，`uplift_stratified = Σ_s (n_s/N)·uplift_s`；辛普森防护同 v0.6.0（粗表观符号 vs 分层符号异号 → 告警、采用分层）。
+
+**收缩/封顶（保守核心）**：`uplift_shrunk = uplift_stratified × n_eff/(n_eff+20)`（先验收缩）；封顶 `clip(uplift_shrunk, ±0.20)`；`n_eff ≥ 20` 且每臂 ≥5 才启用因果分量，否则回退（门控回退到关联路径、权重回退到 insightConfidence、相位不写 = 0）。
+
+### 23.3 三落点
+
+| 落点 | 机制 | 诚实边界 |
+|---|---|---|
+| ① 提炼门控 | `distillGateEnabled=true` 且 `uplift_shrunk < distillUpliftThreshold`（默认 0）→ 拒绝入库，`reason='below_distill_uplift_gate'`——**学会不记住**（近重复/无增量条目不写） | 门控只拒绝新写入，不删除已有条目（"只升不删"纪律的提炼侧对应）；因果增量估计是计数近似，不是校准质量判定 |
+| ② 提炼权重 | 蒸馏条目 `confidence`/效用 = `uplift_shrunk` 的有界映射；`insightConfidence` **降级为辅助信号**（仅作候选 tie-break，不再单独决定入库或置信度） | insightConfidence 自评即便准确率 80–90% 仍有偏（Egami DSL 2306.04746 教训），故降级；`uplift_shrunk` 收缩 + 封顶，永不比关联路径更激进 |
+| ③ 相位写入 | `distillPhase = (uplift_shrunk ≥ 0 ? 0 : π)`，蒸馏时写入 MemoryItem——写时定相，检索侧 v0.7.0 直接消费（不再等到检索时由 ATE 符号推相位） | 相位映射沿用 v0.7.0 约定：θ=0 正贡献（"成功放大器"）、θ=π 负贡献（"负增量条目"，见 §23.7 术语注）；符号仅在反事实对/分层达标时可信，否则收缩为 0 |
+
+**与 insightConfidence 门控的共存**：v0.4.0 的自评门控（`minInsightConfidence`）作为**自评下限**先执行，v0.8.0 的 uplift 门控作为**因果下限**后执行；uplift 样本不足时权重回退 `insightConfidence`（保持 v0.4.0–v0.7.0 行为不变）。
+
+### 23.4 四层映射对齐
+
+| 层 | v0.6.0（检索侧） | v0.8.0（提炼侧） |
+|---|---|---|
+| L1 任务模式 | 混杂分层主键（检索 ATE 的 stratum） | **混杂分层主键（提炼 uplift 的 stratum）**：同一套 L1 分类器/分层变量，处理效应换到 do(distill) |
+| L2 策略模板 | 处置 do(template)（模板选择） | **模板蒸馏处置 do(distill template)**：提炼出的策略模板的增量贡献同理估计；模板 utility 升级为提炼侧 uplift |
+| L3 能力模块 | causalMeta additive（ATE/CATE/样本量） | **distillCausalMeta additive**（uplift/inherited/样本量/相位/CA-ID Card 式字段）；insightConfidence 降级为辅助 |
+| L4 激活动作 | do(retrieve)+配对续写 | **do(distill)+restored-state 反事实**：写动作=干预；反事实=库回到写 m 前再跑（配对 rollout） |
+
+### 23.5 数据模型（additive，零回归）
+
+- **新独立 domain `reasoning_memory_distill_causal`（version 1，与 `reasoning_memory_causal` 并列）**：蒸馏因果事件（配对 rollout 双臂 / 观察性事件 / uplift 估计审计），每 memoryId FIFO 上限（初值 200，同 v0.6.0）。
+- **MemoryItem additive 字段（全部带默认值，不破坏旧介质）**：
+
+  | 字段 | 类型 | 默认 | 语义 |
+  |---|---|---|---|
+  | `distillUplift` | number | `0` | 收缩后的增量因果贡献（clip ±0.20） |
+  | `distillInherited` | number | `0` | 继承效用估计（`apparent − uplift`） |
+  | `distillSamples` | int | `0` | 有效样本量 n_eff |
+  | `distillPhase` | number | `0` | θ∈{0,π}，写时定相 |
+  | `distillGate` | enum `'passed'\|'rejected'\|'na'` | `'na'` | 门控结果；na=未启用 |
+  | `distillEstimand` | string | `''` | CA-ID Card 式：estimand 描述 |
+  | `distillEvidenceProvenance` | string | `''` | CA-ID Card 式：证据来源 |
+  | `distillFalsificationTest` | string | `''` | CA-ID Card 式：可证伪性 |
+
+- **配置（additive，默认关闭/中性）**：`distillGateEnabled`（false）、`distillUpliftThreshold`（0）、`phaseFromDistillUplift`（true）、`distillShrinkPrior`（20）、`distillMinArmSamples`（5）。
+- **Python 新模块 `distill_causal.py`（纯 stdlib、确定性）**：`estimate_distill_uplift` / `gate_distill` / `phase_from_uplift` / `inherited_utility`（设计级要点见 08 研究 §5，函数签名后续 `spec-0.8.0` 定稿）。
+
+### 23.6 识别假设与越界（诚实边界）
+
+**识别假设**（沿 v0.6.0 5 条 + 提炼侧新增 2 条）：
+
+1. 可忽略性（仅控制在已观测混杂下成立；未观测混杂则 uplift 有偏）；
+2. SUTVA（库条目间无干扰；配对 rollout 通过固定其余条目来隔离——这要求可执行 restored-state，否则继承效用无法识别）；
+3. 处置良定义（do(distill m)=写 m；do(¬distill m)=不写 m）；
+4. 结局良定义（Y=环境/验证器终态）；
+5. verdict = 代理标签（收缩 + gold 校验）；
+6. **增量因果符号在纯文本历史下可能不可识别**（Credit Assignment 2604.09459："text-only histories can leave even the sign of credit unidentified"）→ uplift 符号只在对齐的反事实对 / 分层达标时启用，否则收缩为 0、不写相位、退回关联路径；
+7. **restored-state 反事实对是 gold 的唯一来源**；观察性分层估计是低成本近似，不声称等价。
+
+**越界（不做什么）**：
+
+1. 不落地 MGPO 的 memory-rewrite 梯度优化 / 检索器微调（无训练基础设施）；
+2. 不落地 TQG-Exp 的 Trajectory Quality Loss 训练（TQL 需训练；MVP 只借"配对 rollout 估计经验贡献"的估计思想）；
+3. 不委托 LLM 判断因果增量（Kıcıman 2305.00050 / Jin 2306.05836 教训）——全部确定性计数；
+4. 不把 uplift 进 RRF 权重与正反配额（沿用 v0.6.0 硬边界：只作用于提炼门控/权重/相位，检索侧 multiplier 位置不变）；
+5. **线上不做 restored-state rollout**（识别成本高；配对 rollout 只在离线评测/标注集做，线上用观察性分层 + 收缩）；
+6. 不删除低 uplift 已有条目（只拒绝新写入，不改 outcome 池归属）。
+
+### 23.7 与 v0.6.0 / v0.7.0 的交融（含术语注）
+
+- **v0.6.0 = 检索侧因果（do(retrieve) 的 ATE 幅度）**；**v0.8.0 = 提炼侧因果（do(distill) 的 uplift 幅度）**。两者是同一套分层/收缩/封顶机制作用在**不同处置**上，互不替代：v0.8.0 只在其上游（写路径）加一道门控 + 写时定相，v0.6.0 检索侧 ATE 与 multiplier 逻辑**逐字节不变**。
+- **v0.7.0 = 检索侧相位（θ 由 ATE 符号推导）**；**v0.8.0 = 写时定相（θ 由 uplift 符号在蒸馏时即写入）**。检索侧仍消费同一 θ 字段，只是相位来源从"检索时算 ATE 符号"前移到"蒸馏时算 uplift 符号"——`phaseFromDistillUplift=true` 时优先用写时相位，`=false` 或样本不足时回退 v0.7.0 检索侧推导，保证零回归。
+- **术语注（诚实标注）**：本节 θ=0 称"成功放大器"（正增量贡献）、θ=π 称"负增量条目"（应被系统避让/压低的条目），沿用 v0.7.0 的 **θ=π = 负贡献** 约定。"负增量条目"指其表观效用继承自已存信息、自身无正增量乃至有害的条目，**不是**"帮助规避失败的正面教训"——后者（好的失败教训）增量为正、应落 θ=0。以此命名规避"失败避让器"与日常语义（"帮人避失败的好教训"）的冲突，避免检索侧误解相位符号。
+
+### 23.8 测试要点
+
+- **合成已知因果结构**：注入真 uplift；注入"继承效用污染"（apparent 高但 incremental≈0 的近重复条目）→ 估计器分离出增量贡献、门控拒绝入库（"学会不记住"）。
+- **门控边界**：`distillUpliftThreshold` 上下的拒绝/通过、收缩单调性、`n_eff<20`/每臂<5 回退关联路径。
+- **相位映射**：符号→{0,π} 正确；`phaseFromDistillUplift=false` 回退 v0.7.0 检索侧推导。
+- **零回归**：`distillGateEnabled=false` 且新字段全默认 → 与 v0.7.0 输出逐字节一致。
+- **确定性**：双跑全等；辛普森同款检出。
+- **additive 兼容**：旧 MemoryItem（无新字段）读回/检索/反馈不抛错（Node mock 覆盖）。
+
+---
+
 ## 附录：评审记录
 
 - 2026-10-25 第 1 组（架构 + 数据模型 + 生命周期）确认，含补充"存储的推理模块对进行中任务的作用"（四作用点）；
@@ -749,3 +1008,5 @@ v0.5.0 的效用反馈是**关联性**的：`0.8 + 0.4×(helpful+1)/(helpful+har
 - 2026-11-02 四层映射落地（v0.4.0）：依据《推理模块高效复用》综述（30 篇文献）新增策略模板库、7 类任务模式分类、激活计划（`memory_plan_task`）、模板挖掘/发布、检索 template 通道与步骤对齐参数、洞察置信度写入门控、保守弃用标记与 `scripts/eval` 离线评测 harness。路径 A（上下文级）落地，路径 B/C/E（LoRA/SAE/RL 权重级）为文档化越界项（见 §18.4）。DSH 契约经双人核实：v1 domain 新增 templates 表不破坏旧介质（无表结构哈希、缺失表回填空 Map、逐记录读取边界校验），templates 表 schema 铁律为 additive。模板通道 RRF 权重（template 0.15 主臂 / structure 0.05+template 0.20 备选臂）与分类器/挖掘阈值均为待标注集校准的初值。
 - 2026-11-04 推理检索 RAG（v0.5.0）：新增第三个检索面——用户导入开发规范文档，做四层映射对齐的推理感知检索（L1 模式软过滤、L2 新增模块需求 kind `retrieve_document`、L3 独立 domain `reasoning_memory_documents` + 独立索引、L4 步骤对齐文档检索）。依据 8 篇前沿推理 RAG 论文（Self-RAG/RAPTOR/GraphRAG/HippoRAG/Step-Back/HyDE/Adaptive-RAG/IRCoT，数字经 arXiv 复核），严格只做 stdlib 确定性近似（标题层级分块 + 块链接图 + 有界 BFS 多跳 + 确定性查询展开），LLM 摘要/实体抽取/假设文档/训练路由/全局总结全部越界（见 §19）。硬边界：文档检索不进记忆 RRF 通道与正反配额；企业规则 RAG 与记忆检索零回归。
 - 2026-11-06 因果效用引擎（v0.6.0）：把关联性 Beta 效用反馈升级为因果信用分配——按任务模式分层（后门/分层调整）的 ATE/CATE + IPTW 稳健对照 + 配对续写反事实记录原语（`memory_record_counterfactual`）+ 辛普森悖论检测告警；因果乘数 `1+clip(ATE×n_eff/(n_eff+20), ±0.20)` 与 Beta 乘数同区间、永不更激进，样本不足自动回退 Beta（零回归可测）。独立 domain `reasoning_memory_causal` 存因果事件（FIFO 上限）。识别假设 5 条与越界 7 条写入 §20.4：仅控制在已观测混杂下成立；verdict 是代理标签、因果结局用环境 outcome；估计全部确定性计数完成、不委托 LLM。依据 8 篇 arXiv 复核论文（COMA/ProactAgent/Egami×2/Schölkopf/Kıcıman/Jin/Karimi/Retroformer）与 Pearl 因果层级经典，详见 `docs/research-notes/06-causal-ai.md`。
+- 2026-11-09 多概率保持引擎（v0.7.0）：受量子力学概率与因果 AI 启发，把"Agent 壳子把概率模型坍缩为单一输出"作为待解决问题——开源中 Top-1→Top-3 准确率下降被归因于过早坍缩丢失叠加信息。新增四层映射的量子化落地：L1 任务模式输出叠加态（7 类振幅向量）而非单类、L2 模板叠加 + 干涉、L3 能力模块振幅（模长=效用幅度）+ 相位（=因果 ATE 方向）、L4 延迟坍缩 + 显式测量 + 再测量（Lüders 更新）。核心机制三原语（叠加态/干涉项/延迟坍缩）+ 退相干桥接：`ρ→(1−rate)ρ+rate·diag(ρ)`，速率由有效样本量驱动，**完全退相干极限 = v0.6.0 因果引擎行为**，结构上保证 `quantumDecisionEnabled=false` 时零回归。与因果引擎的交融：ATE 符号 → 相位（正=0/负=π），因果方向决定干涉建设/破坏；干涉项 = 边际 ATE 够不到的交互效应（effect modification），也解释 ToE"朴素经验管理低于无经验基线"。诚实边界：不涉量子计算/硬件、不称模型内部为量子、相位只取 {0,π} 实数、确定性优先、干涉只作用于最终 multiplier 封顶 ±20%。新独立 domain `reasoning_memory_quantum`（additive）存叠加/坍缩审计。依据量子认知（Busemeyer/Pothos 期刊书籍）+ Self-Consistency（2203.11171）+ ToT（2305.10601）+ LLM 顺序效应（2308.11483），详见 `docs/research-notes/07-quantum-probability.md`；具体函数实现后续 `spec-0.7.0` 开发（本设计文档为最终主开发文档）。同步检索 3 篇前沿论文作为思路来源（Quantum Abduction 2509.16958 / Credit Assignment 2604.09459 / Contextual Relevance 2511.01208，见 §22）。
+- 2026-11-11 因果因子驱动的任务提炼（v0.8.0）：把 v0.6.0 的检索侧因果信用分配**前移到提炼侧**——用增量因果贡献 `uplift(m)=E[Y|do(distill m)]−E[Y|do(¬distill m)]` 作为任务提炼（`memory_save_outcome`→蒸馏→MemoryItem）的一等信号，把"表观效用"从"继承自已存信息的效用"里分离（MGPO 教训）。三落点：①提炼门控（uplift 低于阈值拒绝入库，"学会不记住"）；②提炼权重（蒸馏 confidence/效用=uplift，insightConfidence 降级为辅助）；③相位写入（uplift 符号→相位 θ∈{0,π}，蒸馏时即定"成功放大器/失败避让器"，检索侧 v0.7.0 直接消费）。新独立 domain `reasoning_memory_distill_causal` + MemoryItem additive 字段（distillUplift/distillInherited/distillSamples/distillPhase/distillGate/CA-ID Card 三字段，全部带默认值）+ 配置默认关闭，零回归可测。识别假设 7 条与越界 6 条写入 §23.6：增量因果符号在纯文本历史下可能不可识别（Credit Assignment 2604.09459）→ 收缩 + restored-state 反事实对为 gold、线上不做 rollout；不委托 LLM 判因果。依据 MGPO 2609.37930 / TQG-Exp 2610.14877 / Credit Assignment 2604.09459（web_fetch 2026-11-11 已复核）+ MemTrial 2610.11732 / COFFEQA 2610.12837（待复核），详见 §23 与 `docs/research-notes/08-causal-distillation.md`。

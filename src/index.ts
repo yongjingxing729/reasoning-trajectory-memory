@@ -27,6 +27,16 @@ import {
   reasoningMemoryCausalDomain,
   type CausalEvent,
 } from './causal-domain.js'
+import {
+  quantumEventSchema,
+  reasoningMemoryQuantumDomain,
+  type QuantumEvent,
+} from './quantum-domain.js'
+import {
+  distillCausalEventSchema,
+  reasoningMemoryDistillCausalDomain,
+  type DistillCausalEvent,
+} from './distill-causal-domain.js'
 import { DocumentLexicalIndex } from './document-index.js'
 import { QdrantDocumentIndex } from './document-vector.js'
 import { checkPythonVersion, runReasoningCore } from './python.js'
@@ -118,6 +128,15 @@ export interface Config {
   documentChunkTargetChars?: number
   documentChunkMinChars?: number
   documentMaxHops?: number
+  quantumDecisionEnabled?: boolean
+  maxSuperpositionSize?: number
+  phaseFromCausal?: boolean
+  decoherenceRate?: number
+  distillGateEnabled?: boolean
+  distillUpliftThreshold?: number
+  phaseFromDistillUplift?: boolean
+  distillShrinkPrior?: number
+  distillMinArmSamples?: number
 }
 
 const defaultPython = process.platform === 'win32' ? 'python' : 'python3'
@@ -171,6 +190,15 @@ export const Config: z<Config> = z.object({
   documentChunkTargetChars: z.number().min(100).default(1200),
   documentChunkMinChars: z.number().min(1).default(300),
   documentMaxHops: z.number().min(0).max(2).default(2),
+  quantumDecisionEnabled: z.boolean().default(false),
+  maxSuperpositionSize: z.number().min(1).max(3).default(3),
+  phaseFromCausal: z.boolean().default(true),
+  decoherenceRate: z.number().min(0).max(1).default(0),
+  distillGateEnabled: z.boolean().default(false),
+  distillUpliftThreshold: z.number().min(-1).max(1).default(0),
+  phaseFromDistillUplift: z.boolean().default(true),
+  distillShrinkPrior: z.number().min(1).default(20),
+  distillMinArmSamples: z.number().min(1).default(5),
 })
 
 type Route = 'auto' | 'semantic' | 'structure' | 'graph' | 'hybrid'
@@ -267,6 +295,23 @@ type RetrievalResponse = {
   templateChannelWeight?: number
   deprecatedFilteredCount?: number
   simpsonNote?: string
+  superposition?: Array<{
+    id: string
+    amplitude: number
+    phase: number
+    p: number
+    interferenceDeltaRaw: number
+    interferenceDelta: number
+    coherence: number
+    collapseReason: string
+  }>
+  quantum?: {
+    coherence: number
+    coherenceBefore: number
+    coherenceAfter: number
+    collapseReason: string
+    estimatorVersion: string
+  }
   reason: string
 }
 
@@ -299,6 +344,23 @@ type PlanResponse = {
     matchThreshold: number
     evaluatedTemplates: number
     querySignature: string[]
+  }
+  superposition?: Array<{
+    id: string
+    amplitude: number
+    phase: number
+    p: number
+    interferenceDeltaRaw: number
+    interferenceDelta: number
+    coherence: number
+    collapseReason: string
+  }>
+  quantum?: {
+    coherence: number
+    coherenceBefore: number
+    coherenceAfter: number
+    collapseReason: string
+    estimatorVersion: string
   }
 }
 
@@ -505,6 +567,22 @@ const RETRIEVE_OUTPUT_SCHEMA = {
   additionalProperties: false,
   properties: {
     memories: { type: 'array', required: true, items: MEMORY_VIEW_SCHEMA },
+    superposition: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          id: { type: 'string', required: true },
+          amplitude: { type: 'number', required: true },
+          phase: { type: 'number', required: true },
+          p: { type: 'number', required: true },
+          interferenceDeltaRaw: { type: 'number', required: true },
+          interferenceDelta: { type: 'number', required: true },
+          coherence: { type: 'number', required: true },
+          collapseReason: { type: 'string', required: true },
+        },
+      },
+    },
     route: { type: 'string', required: true, enum: ['auto', 'semantic', 'structure', 'graph', 'hybrid'] },
     fusionMode: { type: 'string', required: true, enum: ['weighted', 'rrf'] },
     enterpriseRules: { type: 'array', required: true, items: ENTERPRISE_RULE_SCHEMA },
@@ -723,6 +801,22 @@ const PLAN_OUTPUT_SCHEMA = {
         properties: {
           name: { type: 'string', required: true },
           description: { type: 'string', required: true },
+        },
+      },
+    },
+    superposition: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          id: { type: 'string', required: true },
+          amplitude: { type: 'number', required: true },
+          phase: { type: 'number', required: true },
+          p: { type: 'number', required: true },
+          interferenceDeltaRaw: { type: 'number', required: true },
+          interferenceDelta: { type: 'number', required: true },
+          coherence: { type: 'number', required: true },
+          collapseReason: { type: 'string', required: true },
         },
       },
     },
@@ -1132,6 +1226,46 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
   }
 
+  // v0.7.0 quantum collapse audit: its own domain, written once per collapse
+  // point (rank_cutoff when the selected candidates exceed the superposition
+  // cap). The coherent state itself is emitted as the additive superposition[]
+  // field; this log records the collapse metadata for auditability.
+  const quantumDomain = await ctx.storageDomain.open(reasoningMemoryQuantumDomain)
+  const quantumEvents = quantumDomain.table('quantum_events')
+  const MAX_QUANTUM_EVENTS = 2000
+  const writeQuantumEvent = async (event: QuantumEvent): Promise<void> => {
+    await quantumEvents.put(event.eventId, event)
+    const overflow = quantumEvents.size - MAX_QUANTUM_EVENTS
+    if (overflow > 0) {
+      const oldest = [...quantumEvents.entries()]
+        .map(([, record]) => record)
+        .sort((left, right) => left.createdAt - right.createdAt || left.eventId.localeCompare(right.eventId))
+        .slice(0, overflow)
+      for (const record of oldest) await quantumEvents.delete(record.eventId)
+    }
+  }
+
+  // v0.8.0 causal distillation event log: its own domain, holding the
+  // do(distill)/do(not-distill) observational events and paired restored-state
+  // rollout arms. The uplift estimator runs in the Python core; this layer
+  // records and forwards.
+  const distillCausalDomain = await ctx.storageDomain.open(reasoningMemoryDistillCausalDomain)
+  const distillCausalEvents = distillCausalDomain.table('distill_causal_events')
+  const MAX_DISTILL_EVENTS_PER_UNIT = 200
+  const writeDistillCausalEvents = async (events: DistillCausalEvent[]): Promise<void> => {
+    for (const event of events) await distillCausalEvents.put(event.eventId, event)
+    for (const unitId of new Set(events.map(event => event.memoryId))) {
+      const unitEvents = [...distillCausalEvents.entries()]
+        .map(([, event]) => event)
+        .filter(event => event.memoryId === unitId)
+        .sort((left, right) => left.createdAt - right.createdAt || left.eventId.localeCompare(right.eventId))
+      const overflow = unitEvents.length - MAX_DISTILL_EVENTS_PER_UNIT
+      for (const event of unitEvents.slice(0, overflow)) {
+        await distillCausalEvents.delete(event.eventId)
+      }
+    }
+  }
+
   // Startup environment gate: the Python core needs 3.10+; an incompatible or
   // missing interpreter surfaces here as a readable error before any bridge
   // call fails later with an opaque spawn failure.
@@ -1444,6 +1578,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     skillsDomain.close()
     documentsDomain.close()
     causalDomain.close()
+    quantumDomain.close()
+    distillCausalDomain.close()
     apiConfig?.stop()
     // Awaitable shutdown: hosts that honor disposer promises get a clean
     // PGlite teardown; hosts that ignore them keep the fire-and-forget path.
@@ -1788,6 +1924,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         retrievalIntent,
         includeDeprecated,
         causalEventsByMemory,
+        quantumDecisionEnabled: config.quantumDecisionEnabled,
+        maxSuperpositionSize: config.maxSuperpositionSize,
+        phaseFromCausal: config.phaseFromCausal,
+        decoherenceRate: config.decoherenceRate,
         k: requestedK,
         route,
         positiveNegativeRatio: config.positiveNegativeRatio,
@@ -1878,6 +2018,26 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         createdAt: Date.now(),
       })
       await retrievals.put(retrievalId, audit)
+      if (result.quantum && result.superposition && result.quantum.collapseReason) {
+        try {
+          const quantumEvent = quantumEventSchema.parse({
+            eventId: `${retrievalId}:${result.quantum.collapseReason}:${Date.now()}`,
+            retrievalId,
+            kind: 'memory' as const,
+            unitIds: result.superposition.map(entry => entry.id),
+            amplitudes: result.superposition.map(entry => entry.amplitude),
+            phases: result.superposition.map(entry => entry.phase),
+            coherence: result.quantum.coherenceBefore,
+            coherenceAfter: result.quantum.coherenceAfter,
+            collapseReason: result.quantum.collapseReason as QuantumEvent['collapseReason'],
+            estimatorVersion: result.quantum.estimatorVersion,
+            createdAt: Date.now(),
+          })
+          await writeQuantumEvent(quantumEvent)
+        } catch (error) {
+          ctx.logger.warn(`reasoning-memory: quantum collapse audit failed: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
       if (active) {
         for (const item of selected) active.retrievedMemoryIds.add(item.memoryId)
       }
@@ -1891,6 +2051,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
       return {
         memories: selected,
+        ...(result.superposition ? { superposition: result.superposition } : {}),
         enterpriseRules,
         enterpriseRuleRagStatus,
         enterpriseRuleRagRequired,
@@ -2192,6 +2353,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         minInsightConfidence,
         maxItemsPerOutcome: config.maxMemoryItemsPerOutcome,
         deSpecificationThreshold: config.deSpecificationThreshold,
+        distillGateEnabled: config.distillGateEnabled,
+        distillUpliftThreshold: config.distillUpliftThreshold,
+        phaseFromDistillUplift: config.phaseFromDistillUplift,
+        distillShrinkPrior: config.distillShrinkPrior,
+        distillMinArmSamples: config.distillMinArmSamples,
       }, exec.signal)
 
       // v0.6.0 observational causal events: one record per memory retrieved
@@ -2464,6 +2630,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         items: parsed,
         maxItemsPerOutcome: config.maxMemoryItemsPerOutcome,
         deSpecificationThreshold: config.deSpecificationThreshold,
+        distillGateEnabled: config.distillGateEnabled,
+        distillUpliftThreshold: config.distillUpliftThreshold,
+        phaseFromDistillUplift: config.phaseFromDistillUplift,
+        distillShrinkPrior: config.distillShrinkPrior,
+        distillMinArmSamples: config.distillMinArmSamples,
       }, exec.signal)
       if (!result.stored || !result.memories || result.memories.length === 0) {
         return { stored: false, reason: result.reason, memoryIds: [], trustLevel: 'not-applicable' as const }
@@ -2637,6 +2808,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         templates: templateList,
         maxTemplates,
         templateMatchMin,
+        quantumDecisionEnabled: config.quantumDecisionEnabled,
+        maxSuperpositionSize: config.maxSuperpositionSize,
+        phaseFromCausal: config.phaseFromCausal,
+        decoherenceRate: config.decoherenceRate,
       }, exec.signal)
       const matchedIds = result.matchedTemplates.map(template => template.templateId)
       if (active) {
@@ -2670,8 +2845,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const documentHint = documentSteps.length > 0
         ? `Steps ${documentSteps.join(', ')} declare a retrieve_document demand: call memory_retrieve_document for those steps.`
         : ''
+      const { quantum: _quantum, ...planResult } = result
       return {
-        ...result,
+        ...planResult,
         matchedTemplates: result.matchedTemplates.map(template => ({
           templateId: template.templateId,
           name: template.name,

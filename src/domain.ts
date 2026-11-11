@@ -55,6 +55,16 @@ export const memoryItemSchema = z.object({
   strategyTemplateId: z.string().default(''),
   reasoningLevel: z.enum(['analysis', 'path', 'step']).default('path'),
   insightConfidence: z.number().min(0).max(1).default(0),
+  // v0.8.0 causal distillation write-back. All additive with defaults so
+  // legacy v1 memory records read back unchanged.
+  distillUplift: z.number().min(-1).max(1).default(0),
+  distillInherited: z.number().min(-1).max(2).default(0),
+  distillSamples: z.number().int().nonnegative().default(0),
+  distillPhase: z.number().default(0),
+  distillGate: z.enum(['passed', 'rejected', 'na']).default('na'),
+  distillEstimand: z.string().default(''),
+  distillEvidenceProvenance: z.string().default(''),
+  distillFalsificationTest: z.string().default(''),
   status: z.enum(['active', 'deprecated']).default('active'),
   // Recent distinct tasks that rated this memory harmful. A bounded window,
   // not a complete history; used by the conservative deprecation mark.
@@ -164,6 +174,13 @@ const retrievalCandidateSchema = z.object({
   simpsonParadox: z.boolean().default(false),
   causalStrata: z.string().default(''),
   estimatorVersion: z.string().default(''),
+  // v0.7.0 quantum multi-probability audit per candidate. All additive with
+  // defaults so legacy v1 retrieval audits read back unchanged.
+  amplitude: z.number().min(0).max(1).default(0),
+  phase: z.number().default(0),
+  interferenceDelta: z.number().min(-1).max(1).default(0),
+  coherence: z.number().min(0).default(0),
+  collapseReason: z.string().default(''),
 })
 
 export const retrievalRecordSchema = z.object({

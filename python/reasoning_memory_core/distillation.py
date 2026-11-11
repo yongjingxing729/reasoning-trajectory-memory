@@ -27,6 +27,12 @@ from .constants import (
     MAX_TITLE_CHARS,
     TAG_TEXT,
 )
+from .distill_causal import (
+    estimate_distill_uplift,
+    gate_distill,
+    inherited_utility,
+    phase_from_uplift,
+)
 from .reasoning_graph import _fallback_reasoning_graph, _parse_reasoning_graph
 from .text_similarity import _clean_text, semantic_similarity
 from .trajectory import structure_signature
@@ -192,6 +198,27 @@ def _make_memory(request: dict[str, Any]) -> dict[str, Any]:
         reasoning_level = "path"
     gate_rejected = 0
 
+    # v0.8.0 causal distillation inputs (optional and additive). When no
+    # distill causal events are supplied, the whole causal path is skipped so
+    # the distilled MemoryItem stays byte-identical to v0.7.0.
+    distill_gate_enabled = bool(request.get("distillGateEnabled", False))
+    distill_uplift_threshold = 0.0
+    raw_uplift_threshold = request.get("distillUpliftThreshold")
+    if isinstance(raw_uplift_threshold, (int, float)):
+        distill_uplift_threshold = max(-1.0, min(1.0, float(raw_uplift_threshold)))
+    phase_from_distill_uplift = bool(request.get("phaseFromDistillUplift", True))
+    distill_shrink_prior = 20
+    raw_shrink = request.get("distillShrinkPrior")
+    if isinstance(raw_shrink, (int, float)) and float(raw_shrink) > 0:
+        distill_shrink_prior = int(float(raw_shrink))
+    distill_min_arm_samples = 5
+    raw_arm = request.get("distillMinArmSamples")
+    if isinstance(raw_arm, (int, float)) and float(raw_arm) > 0:
+        distill_min_arm_samples = int(float(raw_arm))
+    distill_events = request.get("distillCausalEvents")
+    if not isinstance(distill_events, list):
+        distill_events = []
+
     empty = {"stored": False, "reason": "", "memories": []}
     if outcome not in ("success", "fail"):
         empty["reason"] = "partial/unknown outcomes are not admitted as positive or negative reasoning memories"
@@ -252,7 +279,33 @@ def _make_memory(request: dict[str, Any]) -> dict[str, Any]:
             "insightConfidence": request_confidence,
         }]
 
+    # v0.8.0 causal uplift gate / weight / phase source. The association-path
+    # insightConfidence gate has already run (the self-reported lower bound);
+    # this causal lower bound runs after it. Rejection only blocks NEW writes.
+    distill_estimate = None
+    distill_gate = {"gate": "na", "reason": ""}
+    if distill_events:
+        distill_estimate = estimate_distill_uplift(
+            events=distill_events,
+            shrink_prior=distill_shrink_prior,
+            min_arm_samples=distill_min_arm_samples,
+        )
+        distill_gate = gate_distill(
+            uplift_shrunk=distill_estimate["upliftClipped"],
+            threshold=distill_uplift_threshold,
+            enabled=distill_gate_enabled,
+            applied=distill_estimate["upliftApplied"],
+        )
+        if distill_gate["gate"] == "rejected":
+            empty["reason"] = distill_gate["reason"]
+            empty["gateRejectedCount"] = gate_rejected
+            return empty
+
     now = time.time_ns() // 1_000_000
+    # Precompute the v0.8.0 causal distillation write-back for this batch.
+    distill_applied = bool(distill_estimate and distill_estimate["upliftApplied"])
+    distill_uplift_clipped = distill_estimate["upliftClipped"] if distill_estimate else 0.0
+    distill_apparent = distill_estimate["apparent"] if distill_estimate else 0.0
     memories: list[dict[str, Any]] = []
     for entry in items:
         item_outcome = entry["outcome"]
@@ -265,6 +318,14 @@ def _make_memory(request: dict[str, Any]) -> dict[str, Any]:
             item_graph = _fallback_reasoning_graph(
                 semantic_text, lesson, item_outcome, signature, verifier, evidence,
             )
+        # v0.8.0: when the causal uplift is applied it drives the confidence
+        # (bounded map of uplift_shrunk); otherwise the legacy fixed confidence
+        # stays verbatim (zero regression).
+        confidence = (
+            max(0.0, min(1.0, 0.5 + distill_uplift_clipped))
+            if distill_applied
+            else 0.55 if item_outcome == "success" else 0.35
+        )
         item = {
             "memoryId": str(uuid.uuid4()),
             "type": "strategy" if item_outcome == "success" else "failure",
@@ -298,7 +359,7 @@ def _make_memory(request: dict[str, Any]) -> dict[str, Any]:
                 "summary": evidence,
                 "independentlyVerified": False,
             },
-            "confidence": 0.55 if item_outcome == "success" else 0.35,
+            "confidence": confidence,
             "trustLevel": "unverified",
             "extractorVersion": EXTRACTOR_VERSION,
             "createdAt": now,
@@ -310,6 +371,33 @@ def _make_memory(request: dict[str, Any]) -> dict[str, Any]:
             "insightConfidence": entry.get("insightConfidence", request_confidence),
             "status": "active",
         }
+        # v0.8.0 additive causal distillation fields. Absent unless distill
+        # causal events were supplied (so the v0.7.0 output stays byte-identical
+        # when no events are present).
+        if distill_estimate is not None:
+            item["distillUplift"] = distill_uplift_clipped if distill_applied else 0.0
+            item["distillInherited"] = (
+                inherited_utility(apparent=distill_apparent, uplift_shrunk=distill_uplift_clipped)
+                if distill_applied else 0.0
+            )
+            item["distillSamples"] = int(distill_estimate["nEff"])
+            item["distillPhase"] = (
+                phase_from_uplift(uplift_shrunk=distill_uplift_clipped)
+                if distill_applied and phase_from_distill_uplift else 0.0
+            )
+            item["distillGate"] = distill_gate["gate"]
+            item["distillEstimand"] = (
+                "E[Y | do(distill m)] - E[Y | do(not distill m)], stratified over taskPattern"
+                if distill_applied else ""
+            )
+            item["distillEvidenceProvenance"] = (
+                "paired restored-state rollout" if distill_estimate["pairedPairs"] > 0 else "observational stratified distill events"
+                if distill_applied else ""
+            )
+            item["distillFalsificationTest"] = (
+                "sign disagreement between crude and stratified uplift (Simpson) or n_eff < 20 falsifies the sign"
+                if distill_applied else ""
+            )
         memories.append(item)
 
     label = "memories" if len(memories) > 1 else "memory"

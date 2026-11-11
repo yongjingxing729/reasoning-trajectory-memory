@@ -8,12 +8,14 @@ from typing import Any
 
 from .causal_utils import causal_estimate
 from .constants import (
+    MAX_SUPERPOSITION_SIZE,
     MODULE_DEMAND_KINDS,
     RETRIEVAL_INTENT_WEIGHT_DELTAS,
     TAGS,
     TEMPLATE_RRF_WEIGHTS,
     TEMPLATE_WEIGHTED_WEIGHTS,
 )
+from .qprobability import build_superposition
 from .reasoning_graph import _fallback_reasoning_graph, _parse_reasoning_graph, graph_similarity
 from .text_similarity import _clean_text, _reasoning_text, semantic_similarity, sequence_similarity
 from .trajectory import structure_signature
@@ -104,6 +106,53 @@ def _apply_reciprocal_rank_fusion(
         row["combinedScore"] = round(min(1.0, fused * row["utilityMultiplier"]), 6)
 
 
+def _superposition_audit(
+    rows: list[dict[str, Any]],
+    *,
+    max_superposition_size: int,
+    phase_from_causal: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Build the v0.7.0 superposition audit over already-selected rows.
+
+    Returns (superposition[], quantum summary). Pure additive: it never touches
+    ranking, RRF weights, the outcome quota, or the returned multiplier.
+    """
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        phase = 0.0
+        if phase_from_causal and row.get("causalApplied"):
+            phase = 0.0 if row.get("causalUplift", 0.0) >= 0.0 else math.pi
+        candidates.append({
+            "id": str(row.get("memoryId", "")),
+            "amplitude": float(row.get("combinedScore", 0.0) or 0.0),
+            "phase": phase,
+        })
+
+    full = build_superposition(candidates=candidates)
+    collapse_reason = ""
+    coherence_before = full["coherence"]
+    if len(candidates) > max_superposition_size:
+        collapse_reason = "rank_cutoff"
+        collapsed = build_superposition(candidates=candidates[:max_superposition_size])
+        superposition = collapsed["superposition"]
+        coherence_after = collapsed["coherence"]
+    else:
+        superposition = full["superposition"]
+        coherence_after = full["coherence"]
+
+    for entry in superposition:
+        entry["collapseReason"] = collapse_reason
+
+    quantum = {
+        "coherence": coherence_after,
+        "coherenceBefore": coherence_before,
+        "coherenceAfter": coherence_after,
+        "collapseReason": collapse_reason,
+        "estimatorVersion": full["estimatorVersion"],
+    }
+    return superposition, quantum
+
+
 def _retrieve(request: dict[str, Any]) -> dict[str, Any]:
     query = _clean_text(request.get("query"))
     events = request.get("events") if isinstance(request.get("events"), list) else []
@@ -156,6 +205,16 @@ def _retrieve(request: dict[str, Any]) -> dict[str, Any]:
         for memory_id, events in raw_causal.items():
             if isinstance(events, list):
                 causal_events_by_memory[str(memory_id)] = events
+
+    # v0.7.0 quantum multi-probability inputs (optional and additive). When
+    # disabled (the default) the quantum path is skipped entirely so the output
+    # stays byte-identical to v0.6.0.
+    quantum_enabled = bool(request.get("quantumDecisionEnabled", False))
+    max_superposition_size = MAX_SUPERPOSITION_SIZE
+    raw_max_superposition = request.get("maxSuperpositionSize")
+    if isinstance(raw_max_superposition, (int, float)):
+        max_superposition_size = max(1, min(MAX_SUPERPOSITION_SIZE, int(raw_max_superposition)))
+    phase_from_causal = bool(request.get("phaseFromCausal", True))
 
     has_sparse_candidates = any(
         isinstance(item, dict) and _rank_score(item, "lexicalScore") > 0.0
@@ -367,6 +426,17 @@ def _retrieve(request: dict[str, Any]) -> dict[str, Any]:
     if k == 1 and positive and negative:
         fallback_used = True
 
+    # v0.7.0 superposition audit over the selected rows (additive, deferred
+    # collapse): emitted only when the quantum path is enabled.
+    superposition: list[dict[str, Any]] | None = None
+    quantum_audit: dict[str, Any] | None = None
+    if quantum_enabled:
+        superposition, quantum_audit = _superposition_audit(
+            selected,
+            max_superposition_size=max_superposition_size,
+            phase_from_causal=phase_from_causal,
+        )
+
     context_top = sorted(ranked, key=lambda row: (-row["contextScore"], row["memoryId"]))[: min(k * 2, 20)]
     reasoning_top = sorted(ranked, key=lambda row: (-row["reasoningScore"], row["memoryId"]))[: min(k * 2, 20)]
     structure_top = sorted(ranked, key=lambda row: (-row["structureScore"], row["memoryId"]))[: min(k * 2, 20)]
@@ -432,7 +502,7 @@ def _retrieve(request: dict[str, Any]) -> dict[str, Any]:
             threshold_note = f"{threshold_filtered_count} candidates fell below the relevance threshold and none qualified"
         else:
             threshold_note = f"{threshold_filtered_count} candidates fell below the relevance threshold and were excluded"
-    return {
+    result: dict[str, Any] = {
         "results": selected,
         "candidateScores": candidate_scores,
         "queryHash": query_hash,
@@ -455,3 +525,9 @@ def _retrieve(request: dict[str, Any]) -> dict[str, Any]:
             else ""
         ),
     }
+    # v0.7.0 additive output: the keys are absent when the quantum path is off,
+    # keeping the dictionary shape byte-identical to v0.6.0.
+    if quantum_enabled and superposition is not None and quantum_audit is not None:
+        result["superposition"] = superposition
+        result["quantum"] = quantum_audit
+    return result
